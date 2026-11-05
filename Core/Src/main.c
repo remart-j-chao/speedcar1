@@ -39,7 +39,18 @@
    MDK-Lite 的 32 kB 链接上限会因此报 L6047U 而链接失败。
    平时保持 0；要串口看数据时改成 1（并注意镜像大小）。 */
 #define GYRO_DEBUG 1
-#define IF_start_Brushless_motor 1 //是否启动无刷电机，1为启动，0为不启动
+#define IF_start_Brushless_motor 0 //是否启动无刷电机，1为启动，0为不启动（首次试车先置0）
+
+/* 整车试跑测试：上电后两轮按 MOTOR_TEST_CCR 转动 MOTOR_TEST_RUN_MS 后自动停车。
+   置 0 则不加这段测试逻辑。
+   MOTOR_TEST_CCR 即 TIM1 通道比较值，占空比 = CCR / (Period + 1) = CCR / 7200，
+   1500 约占 20.8%。 */
+#define MOTOR_TEST             1
+#define MOTOR_TEST_CCR         1500U
+#define MOTOR_TEST_RUN_MS      3000U
+/* 前进时的方向脚电平。若某个轮子反转，把对应的一行改成 GPIO_PIN_RESET。 */
+#define L_DIR_FORWARD          GPIO_PIN_SET
+#define R_DIR_FORWARD          GPIO_PIN_SET
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
