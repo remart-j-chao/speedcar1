@@ -44,12 +44,13 @@
 /* 整车试跑测试：上电后两轮按 MOTOR_TEST_CCR 转动 MOTOR_TEST_RUN_MS 后自动停车。
    置 0 则不加这段测试逻辑。
    MOTOR_TEST_CCR 即 TIM1 通道比较值，占空比 = CCR / (Period + 1) = CCR / 7200，
-   1500 约占 20.8%。 */
+   800 约占 11.1%。 */
 #define MOTOR_TEST             1
-#define MOTOR_TEST_CCR         1500U
+#define MOTOR_TEST_CCR        700U
+#define MOTOR_TEST_R_CCR       600U
 #define MOTOR_TEST_RUN_MS      3000U
 /* 前进时的方向脚电平。若某个轮子反转，把对应的一行改成 GPIO_PIN_RESET。 */
-#define L_DIR_FORWARD          GPIO_PIN_SET
+#define L_DIR_FORWARD          GPIO_PIN_RESET
 #define R_DIR_FORWARD          GPIO_PIN_SET
 /* USER CODE END PD */
 
@@ -230,6 +231,14 @@ int main(void)
   Init_brushless_motor(); //等待无刷电调负压启动完成
   /* USER CODE BEGIN 2 */
   dodo_BMI270_init(); // 初始化陀螺仪
+#if MOTOR_TEST
+  uint32_t motor_test_start;
+  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+  TIM1->CCR1 = MOTOR_TEST_CCR;
+  TIM1->CCR2 = MOTOR_TEST_R_CCR;
+  motor_test_start = HAL_GetTick();
+#endif
   //pwm示例
   //TIM1->CCR1 = 2000;
   //TIM1->CCR2 = 2000;
@@ -242,6 +251,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+#if MOTOR_TEST
+    if ((HAL_GetTick() - motor_test_start) >= MOTOR_TEST_RUN_MS)
+    {
+      TIM1->CCR1 = 0U;
+      TIM1->CCR2 = 0U;
+    }
+#endif
     // 以下为陀螺仪使用示例
     dodo_BMI270_get_data();                         // 调用此函数会更新陀螺仪数据
     gyro_x = BMI270_gyro_transition(BMI270_gyro_x); // 将原始陀螺仪数据转换为物理值，单位为度每秒
