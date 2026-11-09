@@ -45,7 +45,7 @@
    置 0 则不加这段测试逻辑。
    MOTOR_TEST_CCR 即 TIM1 通道比较值，占空比 = CCR / (Period + 1) = CCR / 7200，
    800 约占 11.1%。 */
-#define MOTOR_TEST             1
+#define MOTOR_TEST             0
 #define MOTOR_TEST_CCR        700U
 #define MOTOR_TEST_R_CCR       600U
 #define MOTOR_TEST_RUN_MS      3000U
