@@ -289,7 +289,7 @@ TIM1->CCR2 = 2000;    // 右电机占空比 = 2000 / 7200 ≈ 27.8 %
 - 输入滤波 `IC1Filter = 0`，不分频，上升沿
 - **TIM3 需要部分重映射**：`__HAL_AFIO_REMAP_TIM3_PARTIAL()`（否则 CH1/CH2 落在 PA6/PA7）
 
-读数方式（示例未实现，供你补全）：
+读数方式（`main.c` 中已实现：`Encoder_UpdateSpeed()` 由 TIM2 的 1 kHz 中断每 10 ms 调用一次）：
 
 ```c
 int16_t cnt = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);   // 左轮计数增量
@@ -298,6 +298,22 @@ __HAL_TIM_SET_COUNTER(&htim3, 0);                        // 清零，下一周�
 
 > ⚠️ `Period` 是 65535，而 `__HAL_TIM_GET_COUNTER` 返回 `uint32_t`，
 > **做差值时类型转换要正确**，否则反向转动时正负号会出错。
+
+标定参数在 `main.c` 的 `USER CODE BEGIN PD` 里：
+
+| 宏 | 含义 |
+|---|---|
+| `ENCODER_LINES` | 编码器单相每转脉冲数 |
+| `ENCODER_GEAR_RATIO` | 编码器轴到车轮的传动比（编码器直接装车轮轴时填 `1.0`） |
+| `WHEEL_DIAMETER_M` | 车轮直径（m） |
+| `SPEED_SAMPLE_MS` | 采样周期（ms），默认 10 |
+| `SPEED_AVG_SAMPLES` | 滑动平均窗长（样本数），默认 10 → 100 ms 窗口 |
+| `ENC_L_SIGN` / `ENC_R_SIGN` | 左右轮计数方向修正 |
+
+车轮每转一圈计数 = `ENCODER_LINES × 4 × ENCODER_GEAR_RATIO`（13 线霍尔直接装在车轮轴上时是 13 × 4 × 1.0 = **52**）；手推车轮转一圈，累计计数应接近该值，否则说明线数或传动比填错。
+
+因为 13 线编码器一圈只有 52 个计数，单个 10 ms 采样里的增量只有个位数，速度用 `SPEED_AVG_SAMPLES` 个采样（默认 10 个，即 100 ms）做滑动平均后换算；速度仍按 `SPEED_SAMPLE_MS` 周期刷新。
+`SPEED_DEBUG = 1` 时每 `SPEED_PRINT_MS` 输出一行 `enc,左计数,右计数,左mm/s,右mm/s`（计数是最近一次 10 ms 的增量，整数，不引入浮点 printf）。
 
 ### 6.4 TIM2 —— 周期任务时基
 
@@ -308,7 +324,7 @@ __HAL_TIM_SET_COUNTER(&htim3, 0);                        // 清零，下一周�
 | 优先级 | 抢占 1 |
 | 用途 | 预留的固定周期控制任务时基 |
 
-example 中 TIM2 已按 1 ms 周期配置，NVIC 也已使能，但主程序**未调用 `HAL_TIM_Base_Start_IT(&htim2)`**，因此目前没有周期性 TIM2 更新中断。用户需要实现 `HAL_TIM_PeriodElapsedCallback()`，并在控制所需外设和变量准备好之后启动：
+example 中 TIM2 已按 1 ms 周期配置，NVIC 也已使能。`main.c` 现在在 `USER CODE BEGIN 2` 里启动了编码器与 TIM2：
 
 ```c
 if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) {
@@ -316,7 +332,7 @@ if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) {
 }
 ```
 
-回调中应判断 `htim->Instance == TIM2`，再执行周期任务。仅使能 NVIC 或仅编写回调都不会自动启动定时器。
+`HAL_TIM_PeriodElapsedCallback()` 先判断 `htim->Instance == TIM2`，再按 `SPEED_SAMPLE_MS` 分频调用 `Encoder_UpdateSpeed()`。仅使能 NVIC 或仅编写回调都不会自动启动定时器。
 
 ---
 
@@ -428,8 +444,8 @@ mini_car_race_Example/
 
 | # | 项目 | 现状 | 待办 |
 |---|---|---|---|
-| 1 | **控制环** | 主循环只打印陀螺仪数据 | 实现 `HAL_TIM_PeriodElapsedCallback()`，在 TIM2 的 1 kHz 时基里做采样 / PID / 输出 |
-| 2 | **编码器测速** | TIM3/TIM4 已初始化，未读取 | 周期读计数器 → 换算线速度 → 速度环 |
+| 1 | **控制环** | TIM2 1 kHz 回调已启动，但只做编码器采样 | 在回调里加 PID / 差速 / 电机输出 |
+| 2 | **编码器测速** | ✅ 已实现（`Encoder_UpdateSpeed()`，10 ms 周期，输出 mm/s） | 按实际线数 / 减速比 / 轮径标定 `ENCODER_*` 宏，接入速度环 |
 | 3 | **电机输出** | `TIM1->CCR1/CCR2` 固定 2000 | 接 PID 输出，加限幅与死区补偿；补 `L_DIR` / `R_DIR` 方向逻辑 |
 | 4 | **串口接收** | 只发不收 | 启用 `HAL_UART_Receive_IT` / DMA + 空闲中断，做上位机调参与指令下发 |
 | 5 | **printf 阻塞** | 逐字节阻塞发送 | 改 DMA 发送或环形缓冲 |

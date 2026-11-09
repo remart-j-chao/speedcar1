@@ -52,6 +52,29 @@
 /* 前进时的方向脚电平。若某个轮子反转，把对应的一行改成 GPIO_PIN_RESET。 */
 #define L_DIR_FORWARD          GPIO_PIN_RESET
 #define R_DIR_FORWARD          GPIO_PIN_SET
+
+/* ---------------- 编码器测速参数（按实际硬件标定） ----------------
+   车轮每转一圈计数 = ENCODER_LINES × 4（TI12 四倍频）× ENCODER_GEAR_RATIO
+   手推车轮转一圈，累计计数应接近这个值，否则说明线数/传动比填错。
+   13 线霍尔直接装车轮轴时一圈只有 52 个计数，10 ms 内只有个位数的计数，
+   所以速度用 SPEED_AVG_SAMPLES 个采样做滑动平均，窗口 10 × 10 ms = 100 ms。 */
+#define ENCODER_LINES         13.0f     /* 编码器单相每转脉冲数 */
+#define ENCODER_GEAR_RATIO    1.0f      /* 编码器轴到车轮的传动比：直接装在车轮轴上取 1.0 */
+#define WHEEL_DIAMETER_M      0.065f    /* 车轮直径，单位 m */
+#define SPEED_SAMPLE_MS       10U       /* 采样周期，单位 ms（TIM2 为 1 kHz 时基） */
+#define SPEED_AVG_SAMPLES     10U       /* 滑动平均窗长（样本数），10 × 10 ms = 100 ms */
+#define SPEED_WINDOW_MS       (SPEED_SAMPLE_MS * SPEED_AVG_SAMPLES)
+#define ENC_L_SIGN            1         /* 左轮计数方向修正，前进计数为正时保持 1 */
+#define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
+
+/* 一个滑动窗口内的计数之和对应的车轮线速度，单位 m/s，编译期常量 */
+#define ENC_COUNTS_TO_MPS \
+  ((3.14159265f * WHEEL_DIAMETER_M) / \
+   (ENCODER_LINES * 4.0f * ENCODER_GEAR_RATIO) * (1000.0f / (float)SPEED_WINDOW_MS))
+
+/* 测速结果打印开关。以整数 mm/s 输出，不引入额外的浮点 printf 代码。 */
+#define SPEED_DEBUG            1
+#define SPEED_PRINT_MS         100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -148,6 +171,17 @@ static void ESC_DmaTransferComplete(DMA_HandleTypeDef *hdma)
   }
 }
 
+/* 编码器测速结果：TIM2 回调写入，主循环与后续速度环读取 */
+static volatile int32_t enc_left_delta;    /* 最近一次采样的脉冲增量（10 ms） */
+static volatile int32_t enc_right_delta;
+static volatile float   speed_left_mps;    /* 车轮线速度（100 ms 滑窗平均），单位 m/s */
+static volatile float   speed_right_mps;
+static int16_t  enc_left_hist[SPEED_AVG_SAMPLES];
+static int16_t  enc_right_hist[SPEED_AVG_SAMPLES];
+static uint16_t enc_hist_index;
+static int32_t  enc_left_sum;
+static int32_t  enc_right_sum;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -161,6 +195,7 @@ static void MX_TIM3_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
+static void Encoder_UpdateSpeed(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -230,6 +265,14 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   Init_brushless_motor(); //等待无刷电调负压启动完成
   /* USER CODE BEGIN 2 */
+  /* 启动编码器（TIM3 左轮 / TIM4 右轮）与 1 kHz 周期时基；
+     计数器由 TIM2 中断每 SPEED_SAMPLE_MS 读取并清零。 */
+  if (HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK)
+    Error_Handler();
+  if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK)
+    Error_Handler();
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
+    Error_Handler();
   dodo_BMI270_init(); // 初始化陀螺仪
 #if MOTOR_TEST
   uint32_t motor_test_start;
@@ -256,6 +299,18 @@ int main(void)
     {
       TIM1->CCR1 = 0U;
       TIM1->CCR2 = 0U;
+    }
+#endif
+#if SPEED_DEBUG
+    {
+      static uint32_t speed_print_tick;
+      if ((HAL_GetTick() - speed_print_tick) >= SPEED_PRINT_MS)
+      {
+        speed_print_tick = HAL_GetTick();
+        printf("enc,%ld,%ld,%ld,%ld\r\n",
+               (long)enc_left_delta, (long)enc_right_delta,
+               (long)(speed_left_mps * 1000.0f), (long)(speed_right_mps * 1000.0f));
+      }
     }
 #endif
     // 以下为陀螺仪使用示例
@@ -711,6 +766,47 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* 读一次两个编码器的计数增量。计数器是 16 位，必须按 int16_t 解读，
+   否则反转时回绕出来的 65535 会被当成很大的正数。
+   13 线霍尔一圈只有 52 个计数，单次 10 ms 的增量太小，速度用滑窗求和后换算；
+   滑窗长度 SPEED_AVG_SAMPLES × SPEED_SAMPLE_MS = 100 ms，起步后 100 ms 内偏小。 */
+static void Encoder_UpdateSpeed(void)
+{
+  int16_t left  = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+  int16_t right = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+  __HAL_TIM_SET_COUNTER(&htim3, 0U);
+  __HAL_TIM_SET_COUNTER(&htim4, 0U);
+
+  left  = (int16_t)(ENC_L_SIGN * left);
+  right = (int16_t)(ENC_R_SIGN * right);
+
+  /* 滑窗：减去最老的一次采样，再写入本次采样 */
+  enc_left_sum  += left  - enc_left_hist[enc_hist_index];
+  enc_right_sum += right - enc_right_hist[enc_hist_index];
+  enc_left_hist[enc_hist_index]  = left;
+  enc_right_hist[enc_hist_index] = right;
+  if (++enc_hist_index >= SPEED_AVG_SAMPLES)
+    enc_hist_index = 0U;
+
+  enc_left_delta  = left;
+  enc_right_delta = right;
+  speed_left_mps  = (float)enc_left_sum  * ENC_COUNTS_TO_MPS;
+  speed_right_mps = (float)enc_right_sum * ENC_COUNTS_TO_MPS;
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  static uint16_t speed_divider;
+
+  if (htim->Instance != TIM2)
+    return;
+
+  if (++speed_divider < SPEED_SAMPLE_MS)
+    return;
+  speed_divider = 0U;
+
+  Encoder_UpdateSpeed();
+}
 
 /* USER CODE END 4 */
 
