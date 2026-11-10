@@ -73,6 +73,8 @@
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
 #define LINE_ERROR_SCALE        1000L
+#define RUN_BUTTON_DEBOUNCE_MS  20U
+#define RUN_BUTTON_PRESSED      GPIO_PIN_RESET
 
 /* 一个滑动窗口内的计数之和对应的车轮线速度，单位 m/s，编译期常量 */
 #define ENC_COUNTS_TO_MPS \
@@ -197,6 +199,9 @@ static volatile int16_t line_error_milli;
 /* 至少有一路传感器检测到白线时为 1；全无信号时为 0。 */
 static volatile uint8_t line_sensor_valid;
 
+/* 发车键稳定按下后锁存为 1；当前仅记录状态，不触发电机或风扇。 */
+static volatile uint8_t run_button_started;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -212,6 +217,7 @@ static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 static void Encoder_UpdateSpeed(void);
 static void LineSensor_Update(void);
+static void RunButton_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -256,6 +262,34 @@ static void LineSensor_Update(void)
   /* 对有效传感器的权重取平均，避免多路同时压线时偏差被放大。 */
   line_error_milli = (int16_t)((weighted_position * LINE_ERROR_SCALE) / active_count);
   line_sensor_valid = 1U;
+}
+
+/* 非阻塞消抖：PB14 按下电平持续 20 ms 后锁存发车状态。 */
+static void RunButton_Update(void)
+{
+  static GPIO_PinState candidate_state = GPIO_PIN_SET;
+  static GPIO_PinState stable_state = GPIO_PIN_SET;
+  static uint32_t candidate_since;
+  GPIO_PinState raw_state = HAL_GPIO_ReadPin(GPIO_RUN_GPIO_Port, GPIO_RUN_Pin);
+  uint32_t now = HAL_GetTick();
+
+  /* 原始电平发生变化时重新开始计时，等待机械触点稳定。 */
+  if (raw_state != candidate_state)
+  {
+    candidate_state = raw_state;
+    candidate_since = now;
+    return;
+  }
+
+  if ((raw_state != stable_state) &&
+      ((uint32_t)(now - candidate_since) >= RUN_BUTTON_DEBOUNCE_MS))
+  {
+    stable_state = raw_state;
+
+    /* 本项目按低电平按下处理；按键只设置状态，不启动任何动力输出。 */
+    if ((stable_state == RUN_BUTTON_PRESSED) && (run_button_started == 0U))
+      run_button_started = 1U;
+  }
 }
 
 void Init_brushless_motor(void)
@@ -345,6 +379,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    RunButton_Update();
+
+    /* 仅在首次确认按下后报告状态，供后续控制逻辑使用。 */
+    if (run_button_started != 0U)
+    {
+      static uint8_t run_state_reported;
+      if (run_state_reported == 0U)
+      {
+        printf("run,1\r\n");
+        run_state_reported = 1U;
+      }
+    }
+
     /* 每 10 ms 更新一次循迹数据；此步骤只采样，不改变左右轮 PWM。 */
     {
       static uint32_t line_sample_tick;

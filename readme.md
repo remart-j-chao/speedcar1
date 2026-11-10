@@ -41,7 +41,7 @@ example 和 test 均将 **PB14** 标记为 `GPIO_RUN`，配置为普通 GPIO 输
 GPIO_PinState run_level = HAL_GPIO_ReadPin(GPIO_RUN_GPIO_Port, GPIO_RUN_Pin);
 ```
 
-`GPIO_RUN` 是发车键的逻辑名称，实际端口仍是 GPIOB、第 14 脚；其他 GPIOB 引脚不改名。example 仅配置引脚，不加入按键等待；test 的 `_Start_()` 使用上述宏读取按键，两次读到低电平、间隔 20 ms 后继续启动。
+`GPIO_RUN` 是发车键的逻辑名称，实际端口仍是 GPIOB、第 14 脚；其他 GPIOB 引脚不改名。当前应用以非阻塞方式轮询 PB14：低电平持续 20 ms 后锁存发车状态，并通过 USART3 输出一次 `run,1`。该状态目前仅供后续控制逻辑使用，不会启动电机或负压风扇。test 的 `_Start_()` 使用上述宏读取按键，两次读到低电平、间隔 20 ms 后继续启动。
 
 输入空闲电平由外部电路提供；若按键仅接 PB14 和 GND，需要外部上拉，或另行改为内部上拉。
 
