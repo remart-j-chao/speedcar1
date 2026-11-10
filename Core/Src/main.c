@@ -76,6 +76,24 @@
 #define RUN_BUTTON_DEBOUNCE_MS  20U
 #define RUN_BUTTON_PRESSED      GPIO_PIN_RESET
 
+/* 控制器只在完成实车标定后启用；0 表示不向电机 PWM 写入控制量。 */
+#define MOTOR_CONTROL_ENABLE       0U
+#define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
+#define CONTROL_TARGET_SPEED_MPS   0.0f
+#define CONTROL_MAX_PWM_CCR        700.0f
+#define CONTROL_MAX_YAW_RATE_DPS   180.0f
+
+/* 以下增益均为待标定值，默认置零，避免未经调参产生电机输出。 */
+#define LINE_PD_KP                 0.0f  /* 目标角速度 / 循迹误差 */
+#define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率 */
+#define YAW_PID_KP                 0.0f  /* 差速 PWM / 角速度误差 */
+#define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
+#define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
+#define SPEED_PI_KP                0.0f  /* 基础 PWM / 速度误差 */
+#define SPEED_PI_KI                0.0f  /* 基础 PWM / 速度误差积分 */
+#define YAW_INTEGRAL_LIMIT         500.0f
+#define SPEED_INTEGRAL_LIMIT       2.0f
+
 /* 一个滑动窗口内的计数之和对应的车轮线速度，单位 m/s，编译期常量 */
 #define ENC_COUNTS_TO_MPS \
   ((3.14159265f * WHEEL_DIAMETER_M) / \
@@ -201,6 +219,22 @@ static volatile uint8_t line_sensor_valid;
 
 /* 发车键稳定按下后锁存为 1；当前仅记录状态，不触发电机或风扇。 */
 static volatile uint8_t run_button_started;
+/* IMU 初始化状态：失败时禁止后续控制计算。 */
+static volatile uint8_t imu_ready;
+
+/* 控制器中间量与限幅后的左右轮 PWM，便于调试器查看。 */
+static volatile float control_target_yaw_rate_dps;
+static volatile float control_turn_pwm;
+static volatile float control_base_pwm;
+static volatile uint16_t control_left_pwm;
+static volatile uint16_t control_right_pwm;
+
+typedef struct
+{
+  float integral;
+  float previous_error;
+  uint8_t initialized;
+} ControlLoopState;
 
 /* USER CODE END PV */
 
@@ -218,6 +252,7 @@ static void MX_TIM4_Init(void);
 static void Encoder_UpdateSpeed(void);
 static void LineSensor_Update(void);
 static void RunButton_Update(void);
+static void VehicleControl_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -227,7 +262,8 @@ int fputc(int ch, FILE *f)
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xffff);
   return ch;
 }
-float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
+/* 主循环更新、TIM2 控制回调读取的 IMU 物理量。 */
+volatile float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z;
 /* USER CODE END 0 */
 
 /* 读取 12 路光电管并计算白线相对车体中心的位置，不控制电机。 */
@@ -262,6 +298,126 @@ static void LineSensor_Update(void)
   /* 对有效传感器的权重取平均，避免多路同时压线时偏差被放大。 */
   line_error_milli = (int16_t)((weighted_position * LINE_ERROR_SCALE) / active_count);
   line_sensor_valid = 1U;
+}
+
+/* 将控制器状态清零，防止停机或丢线期间积分继续累积。 */
+static void VehicleControl_Reset(ControlLoopState *line_state,
+                                 ControlLoopState *yaw_state,
+                                 ControlLoopState *speed_state)
+{
+  line_state->integral = 0.0f;
+  line_state->previous_error = 0.0f;
+  line_state->initialized = 0U;
+  yaw_state->integral = 0.0f;
+  yaw_state->previous_error = 0.0f;
+  yaw_state->initialized = 0U;
+  speed_state->integral = 0.0f;
+  speed_state->previous_error = 0.0f;
+  speed_state->initialized = 0U;
+
+  control_target_yaw_rate_dps = 0.0f;
+  control_turn_pwm = 0.0f;
+  control_base_pwm = 0.0f;
+  control_left_pwm = 0U;
+  control_right_pwm = 0U;
+
+  /* 只有显式启用控制器后，安全条件失效才会将电机 PWM 清零。 */
+  if (MOTOR_CONTROL_ENABLE != 0U)
+  {
+    TIM1->CCR1 = 0U;
+    TIM1->CCR2 = 0U;
+  }
+}
+
+/* 限制控制量，避免积分饱和或请求超出允许的 PWM / 角速度范围。 */
+static float Control_Clamp(float value, float minimum, float maximum)
+{
+  if (value < minimum)
+    return minimum;
+  if (value > maximum)
+    return maximum;
+  return value;
+}
+
+/*
+ * 三级控制计算（每 10 ms 调用一次）：
+ * 光电管位置 PD 生成目标偏航角速度，陀螺仪 PID 生成左右轮差速，
+ * 编码器速度 PI 生成基础油门。默认仅计算调试量，不写电机 PWM。
+ */
+static void VehicleControl_Update(void)
+{
+  static ControlLoopState line_state;
+  static ControlLoopState yaw_state;
+  static ControlLoopState speed_state;
+  const float dt = (float)CONTROL_UPDATE_MS / 1000.0f;
+  float line_error;
+  float line_derivative;
+  float yaw_error;
+  float yaw_derivative;
+  float speed_error;
+  float average_speed;
+  float left_pwm;
+  float right_pwm;
+
+  /* 未按下发车键、光电管丢线或 IMU 未初始化时，不允许控制输出。 */
+  if ((run_button_started == 0U) ||
+      (line_sensor_valid == 0U) ||
+      (imu_ready == 0U))
+  {
+    VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+    return;
+  }
+
+  /* 将循迹误差从千分之一权重还原为传感器权重。 */
+  line_error = (float)line_error_milli / (float)LINE_ERROR_SCALE;
+  line_derivative = line_state.initialized ?
+                    (line_error - line_state.previous_error) / dt : 0.0f;
+  control_target_yaw_rate_dps = Control_Clamp(
+      (LINE_PD_KP * line_error) + (LINE_PD_KD * line_derivative),
+      -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
+  line_state.previous_error = line_error;
+  line_state.initialized = 1U;
+
+  /* 目标角速度与 BMI270 Z 轴角速度之差由 PID 转为左右轮差速量。 */
+  yaw_error = control_target_yaw_rate_dps - gyro_z;
+  yaw_derivative = yaw_state.initialized ?
+                   (yaw_error - yaw_state.previous_error) / dt : 0.0f;
+  yaw_state.integral = Control_Clamp(yaw_state.integral + yaw_error * dt,
+                                     -YAW_INTEGRAL_LIMIT, YAW_INTEGRAL_LIMIT);
+  control_turn_pwm = Control_Clamp(
+      (YAW_PID_KP * yaw_error) +
+      (YAW_PID_KI * yaw_state.integral) +
+      (YAW_PID_KD * yaw_derivative),
+      -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
+  yaw_state.previous_error = yaw_error;
+  yaw_state.initialized = 1U;
+
+  /* 平均左右轮速度与目标速度之差由 PI 转为公共基础 PWM。 */
+  average_speed = (speed_left_mps + speed_right_mps) * 0.5f;
+  speed_error = CONTROL_TARGET_SPEED_MPS - average_speed;
+  speed_state.integral = Control_Clamp(speed_state.integral + speed_error * dt,
+                                       -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
+  control_base_pwm = Control_Clamp(
+      (SPEED_PI_KP * speed_error) + (SPEED_PI_KI * speed_state.integral),
+      0.0f, CONTROL_MAX_PWM_CCR);
+  speed_state.previous_error = speed_error;
+  speed_state.initialized = 1U;
+
+  left_pwm = Control_Clamp(control_base_pwm - control_turn_pwm,
+                           0.0f, CONTROL_MAX_PWM_CCR);
+  right_pwm = Control_Clamp(control_base_pwm + control_turn_pwm,
+                            0.0f, CONTROL_MAX_PWM_CCR);
+  control_left_pwm = (uint16_t)left_pwm;
+  control_right_pwm = (uint16_t)right_pwm;
+
+  /* 电机输出需人工完成标定后才可启用；当前编译配置保持关闭。 */
+  if (MOTOR_CONTROL_ENABLE != 0U)
+  {
+    HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+    HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+    TIM1->CCR1 = control_left_pwm;
+    TIM1->CCR2 = control_right_pwm;
+  }
 }
 
 /* 非阻塞消抖：PB14 按下电平持续 20 ms 后锁存发车状态。 */
@@ -358,7 +514,12 @@ int main(void)
     Error_Handler();
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
     Error_Handler();
-  dodo_BMI270_init(); // 初始化陀螺仪
+  {
+    int8_t bmi_init_result = dodo_BMI270_init();
+    imu_ready = (bmi_init_result == 0) ? 1U : 0U;
+    if (imu_ready == 0U)
+      printf("imu_init,fail,%d\r\n", (int)bmi_init_result);
+  }
 #if MOTOR_TEST
   uint32_t motor_test_start;
   HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
@@ -441,6 +602,24 @@ int main(void)
         printf("enc,%ld,%ld,%ld,%ld\r\n",
                (long)enc_left_delta, (long)enc_right_delta,
                (long)(speed_left_mps * 1000.0f), (long)(speed_right_mps * 1000.0f));
+      }
+    }
+#endif
+#if SPEED_DEBUG
+    {
+      static uint32_t control_print_tick;
+      if ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS)
+      {
+        control_print_tick = HAL_GetTick();
+        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u\r\n",
+               (unsigned int)run_button_started,
+               (unsigned int)line_sensor_valid,
+               (unsigned int)imu_ready,
+               (long)(control_target_yaw_rate_dps * 1000.0f),
+               (long)(control_turn_pwm * 1000.0f),
+               (long)(control_base_pwm * 1000.0f),
+               (unsigned int)control_left_pwm,
+               (unsigned int)control_right_pwm);
       }
     }
 #endif
@@ -944,6 +1123,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   speed_divider = 0U;
 
   Encoder_UpdateSpeed();
+  VehicleControl_Update();
 }
 
 /* USER CODE END 4 */
