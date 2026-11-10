@@ -67,6 +67,13 @@
 #define ENC_L_SIGN            1         /* 左轮计数方向修正，前进计数为正时保持 1 */
 #define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
 
+/* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
+#define LINE_SENSOR_ACTIVE_LEVEL 1U
+#define LINE_SAMPLE_MS          10U
+#define LINE_SENSOR_DEBUG       1
+#define LINE_PRINT_MS           100U
+#define LINE_ERROR_SCALE        1000L
+
 /* 一个滑动窗口内的计数之和对应的车轮线速度，单位 m/s，编译期常量 */
 #define ENC_COUNTS_TO_MPS \
   ((3.14159265f * WHEEL_DIAMETER_M) / \
@@ -75,6 +82,7 @@
 /* 测速结果打印开关。以整数 mm/s 输出，不引入额外的浮点 printf 代码。 */
 #define SPEED_DEBUG            1
 #define SPEED_PRINT_MS         100U
+#define GYRO_PRINT_MS          100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -182,6 +190,13 @@ static uint16_t enc_hist_index;
 static int32_t  enc_left_sum;
 static int32_t  enc_right_sum;
 
+/* 循迹状态：通道 0 在最左侧，通道 11 在最右侧。 */
+static volatile uint16_t line_sensor_bits;
+/* 偏差单位为千分之一传感器权重，左偏为负，右偏为正。 */
+static volatile int16_t line_error_milli;
+/* 至少有一路传感器检测到白线时为 1；全无信号时为 0。 */
+static volatile uint8_t line_sensor_valid;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -196,6 +211,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 static void Encoder_UpdateSpeed(void);
+static void LineSensor_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -207,6 +223,41 @@ int fputc(int ch, FILE *f)
 }
 float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
 /* USER CODE END 0 */
+
+/* 读取 12 路光电管并计算白线相对车体中心的位置，不控制电机。 */
+static void LineSensor_Update(void)
+{
+  uint16_t sensor_bits;
+  uint16_t active_count = 0U;
+  int32_t weighted_position = 0;
+  uint16_t channel;
+
+  MUX_get_value(&sensor_bits);
+  line_sensor_bits = sensor_bits;
+
+  for (channel = 0U; channel < MULTIPLEXER_CHANNEL_NUM; ++channel)
+  {
+    if (MUX_GET_CHANNEL(sensor_bits, channel) == LINE_SENSOR_ACTIVE_LEVEL)
+    {
+      /* 按教程采用左侧 -6 至 -1、右侧 +1 至 +6 的循迹权重。 */
+      int32_t weight = (channel < 6U) ? ((int32_t)channel - 6L) : ((int32_t)channel - 5L);
+      weighted_position += weight;
+      ++active_count;
+    }
+  }
+
+  if (active_count == 0U)
+  {
+    line_error_milli = 0;
+    line_sensor_valid = 0U;
+    return;
+  }
+
+  /* 对有效传感器的权重取平均，避免多路同时压线时偏差被放大。 */
+  line_error_milli = (int16_t)((weighted_position * LINE_ERROR_SCALE) / active_count);
+  line_sensor_valid = 1U;
+}
+
 void Init_brushless_motor(void)
 {
   /* PA11 idles low: the first high level then also lasts exactly 0.9 ms,
@@ -294,11 +345,44 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* 每 10 ms 更新一次循迹数据；此步骤只采样，不改变左右轮 PWM。 */
+    {
+      static uint32_t line_sample_tick;
+      uint32_t now = HAL_GetTick();
+      if ((now - line_sample_tick) >= LINE_SAMPLE_MS)
+      {
+        line_sample_tick = now;
+        LineSensor_Update();
+      }
+    }
 #if MOTOR_TEST
     if ((HAL_GetTick() - motor_test_start) >= MOTOR_TEST_RUN_MS)
     {
       TIM1->CCR1 = 0U;
       TIM1->CCR2 = 0U;
+    }
+#endif
+#if LINE_SENSOR_DEBUG
+    {
+      static uint32_t line_print_tick;
+      if ((HAL_GetTick() - line_print_tick) >= LINE_PRINT_MS)
+      {
+        line_print_tick = HAL_GetTick();
+        printf("line,%u%u%u%u%u%u%u%u%u%u%u%u,%u,%d\r\n",
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 0U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 1U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 2U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 3U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 4U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 5U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 6U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 7U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 8U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 9U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 10U),
+               (unsigned int)MUX_GET_CHANNEL(line_sensor_bits, 11U),
+               (unsigned int)line_sensor_valid, (int)line_error_milli);
+      }
     }
 #endif
 #if SPEED_DEBUG
@@ -322,7 +406,14 @@ int main(void)
     accel_y = BMI270_acc_transition(BMI270_accel_y);
     accel_z = BMI270_acc_transition(BMI270_accel_z);
     if (GYRO_DEBUG)
-      printf("%f,%f,%f,%f,%f,%f\r\n",gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z);
+    {
+      static uint32_t gyro_print_tick;
+      if ((HAL_GetTick() - gyro_print_tick) >= GYRO_PRINT_MS)
+      {
+        gyro_print_tick = HAL_GetTick();
+        printf("%f,%f,%f,%f,%f,%f\r\n",gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z);
+      }
+    }
     // 以下为读取光电管的示例（从左到右编号0~11）
     //  uint16_t mux_value;
     //  MUX_get_value(&mux_value);
