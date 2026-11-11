@@ -170,7 +170,10 @@ static volatile uint16_t fault_ccr_r;
    而线偏右（err>0）时必须右转，所以这里取 -1。
    符号错的表现：直道几秒就甩出线，弯道直接冲出赛道（越偏越往外打）。 */
 #define LINE_ERROR_SIGN            (-1.0f)
-#define YAW_PID_KP                 12.0f /* 差速 PWM / 角速度误差 */
+#define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差。
+                                            P 只是补前馈的残差：10/5500≈0.0018 m/s per dps，
+                                           再加前馈 0.0024，静态总增益约 0.0042，
+                                           已高于"完全跟上目标"所需的 0.00244，不宜再加大。 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
 #define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
