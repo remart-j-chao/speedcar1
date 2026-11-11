@@ -151,10 +151,13 @@ static volatile uint16_t fault_ccr_r;
    一旦启动无法关闭，调试器停在断点会触发复位，调试阶段保持 0。 */
 #define WATCHDOG_ENABLE            0
 
-/* 以下增益均为待标定值，默认置零，避免未经调参产生电机输出。 */
-#define LINE_PD_KP                 0.0f  /* 目标角速度 / 循迹误差 */
+/* 以下增益均为实车标定值；可在运行中用在线整定命令改写。
+   角速度 Kp 注意尺度：turn→差速换算为 YAW_DIFF_PWM_PER_MPS=5500，
+   kp=10 时 10 dps 误差只产生 0.018 m/s 差速（闭环增益约 0.8，稳定区）。
+   历史上按旧尺度(550)调出的 80 在本尺度下相当于 800，会让车身持续振荡。 */
+#define LINE_PD_KP                 5.0f  /* 目标角速度 / 循迹误差 */
 #define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率 */
-#define YAW_PID_KP                 80.0f  /* 差速 PWM / 角速度误差 */
+#define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
 #define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
