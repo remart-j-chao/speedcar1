@@ -79,9 +79,54 @@
 /* 控制器只在完成实车标定后启用；0 表示不向电机 PWM 写入控制量。 */
 #define MOTOR_CONTROL_ENABLE       0U
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
-#define CONTROL_TARGET_SPEED_MPS   0.0f
+/* 速度环目标，起步标定值。若为 0，速度误差恒为负，基础 PWM 会被钳在 0 而无法起步。 */
+#define CONTROL_TARGET_SPEED_MPS   0.25f
 #define CONTROL_MAX_PWM_CCR        700.0f
 #define CONTROL_MAX_YAW_RATE_DPS   180.0f
+
+/* 陀螺仪安装方向修正：让"右转（俯视顺时针）"对应正角速度，与
+   left = base - turn / right = base + turn 的差速定义保持一致。
+   实测方法：手拿车顺时针慢转，串口 gyro 打印的 z 应为正；若为负改成 -1.0f。 */
+#define YAW_RATE_SIGN              1.0f
+/* 扣除零偏后的静止死区，单位 dps；残余漂移小于该值时按 0 处理。 */
+#define GYRO_DEADBAND_DPS          0.3f
+/* 上电后先静置一段时间等滤波器稳定，再用静止期样本求零偏均值。
+   累积样本数设上限，避免长时间等待后浮点累加和过大而损失精度。 */
+#define GYRO_BIAS_SETTLE_MS        500U
+#define GYRO_BIAS_MIN_SAMPLES      100U
+#define GYRO_BIAS_MAX_SAMPLES      20000U
+
+/* 短暂丢线时保持最后一次偏差继续盲开的时间，超时仍无信号才停机。 */
+#define LINE_LOST_HOLD_MS          300U
+#define LINE_LOST_HOLD_TICKS       (LINE_LOST_HOLD_MS / CONTROL_UPDATE_MS)
+
+/* 发车后目标速度的爬升率，避免目标速度阶跃造成打滑和电流冲击。 */
+#define CONTROL_ACCEL_LIMIT_MPS2   1.0f
+
+/* 实测起转 CCR（死区）：低于该占空比轮子不转。填 0 表示不做死区补偿。
+   标定方法：逐级加大 CCR，记录轮子刚开始转动的最小值，左右轮分别填。 */
+#define MOTOR_DEADZONE_L           0.0f
+#define MOTOR_DEADZONE_R           0.0f
+
+/* 堵转保护：指令 PWM 已超过该值、两轮速度都接近 0 并持续一段时间，判定卡死停机。 */
+#define MOTOR_STALL_PWM_MIN        200U
+#define MOTOR_STALL_SPEED_MPS      0.02f
+#define MOTOR_STALL_MS             800U
+#define MOTOR_STALL_TICKS          (MOTOR_STALL_MS / CONTROL_UPDATE_MS)
+#define MOTOR_RUN_GRACE_MS         1000U
+#define MOTOR_GRACE_TICKS          (MOTOR_RUN_GRACE_MS / CONTROL_UPDATE_MS)
+
+/* 角速度数据超时：主循环被阻塞或 SPI 卡死时不允许控制环继续使用旧值。 */
+#define GYRO_SAMPLE_TIMEOUT_MS     100U
+
+/* 故障码：非 0 时控制环停机，并由主循环打印一次。 */
+#define FAULT_NONE                 0U
+#define FAULT_STALL                1U
+#define FAULT_IMU                  2U
+
+/* 独立看门狗：1 表示启用（LSI 约 40 kHz、超时约 0.8 s）。
+   一旦启动无法关闭，调试器停在断点会触发复位，调试阶段保持 0。 */
+#define WATCHDOG_ENABLE            0
 
 /* 以下增益均为待标定值，默认置零，避免未经调参产生电机输出。 */
 #define LINE_PD_KP                 0.0f  /* 目标角速度 / 循迹误差 */
@@ -217,10 +262,26 @@ static volatile int16_t line_error_milli;
 /* 至少有一路传感器检测到白线时为 1；全无信号时为 0。 */
 static volatile uint8_t line_sensor_valid;
 
-/* 发车键稳定按下后锁存为 1；当前仅记录状态，不触发电机或风扇。 */
+/* 发车键每按一次在"待发车"和"运行中"之间切换：1 表示运行中。 */
 static volatile uint8_t run_button_started;
 /* IMU 初始化状态：失败时禁止后续控制计算。 */
 static volatile uint8_t imu_ready;
+
+/* 故障码，非 0 时控制环停机；由主循环打印一次。 */
+static volatile uint8_t control_fault;
+/* 最近一次 IMU 采样时刻，用于检测角速度数据是否过期。 */
+static volatile uint32_t gyro_sample_tick;
+/* 速度环斜坡后的目标速度，单位 m/s。 */
+static float control_speed_target_mps;
+
+/* 陀螺仪 Z 轴零偏校准：发车键按下前车静止，用这段时间累积样本求均值，
+   按键锁存那一刻固化为 offset。offset 保存的是未做安装方向修正的原始值。 */
+static uint32_t gyro_bias_tick;
+static uint32_t gyro_bias_count;
+static float    gyro_bias_sum;
+static float    gyro_z_offset;
+static uint8_t  gyro_bias_ready;
+static uint8_t  gyro_bias_latched;
 
 /* 控制器中间量与限幅后的左右轮 PWM，便于调试器查看。 */
 static volatile float control_target_yaw_rate_dps;
@@ -252,6 +313,7 @@ static void MX_TIM4_Init(void);
 static void Encoder_UpdateSpeed(void);
 static void LineSensor_Update(void);
 static void RunButton_Update(void);
+static void GyroBias_Update(float raw_gyro_z);
 static void VehicleControl_Update(void);
 /* USER CODE END PFP */
 
@@ -300,6 +362,62 @@ static void LineSensor_Update(void)
   line_sensor_valid = 1U;
 }
 
+/* 陀螺仪零偏校准：发车键按下前整车静止，用这段时间累积 Z 轴角速度求均值，
+   按键锁存瞬间固化为 offset，之后控制环使用（原始值 - offset）消除恒定漂移。
+   必须在主循环读取 IMU 之后调用，raw_gyro_z 是未扣除零偏的物理值。 */
+static void GyroBias_Update(float raw_gyro_z)
+{
+  if ((imu_ready == 0U) || (gyro_bias_latched != 0U))
+    return;
+
+  if (gyro_bias_ready == 0U)
+  {
+    /* 0 用作"尚未开始计时"的标记，避免上电瞬间 HAL_GetTick() 返回 0 时反复重置 */
+    if (gyro_bias_tick == 0U)
+    {
+      gyro_bias_tick = HAL_GetTick();
+      if (gyro_bias_tick == 0U)
+        gyro_bias_tick = 1U;
+      return;
+    }
+    if ((HAL_GetTick() - gyro_bias_tick) < GYRO_BIAS_SETTLE_MS)
+      return;
+    gyro_bias_ready = 1U;
+  }
+
+  if (run_button_started == 0U)
+  {
+    if (gyro_bias_count < GYRO_BIAS_MAX_SAMPLES)
+    {
+      gyro_bias_sum += raw_gyro_z;
+      ++gyro_bias_count;
+    }
+    return;
+  }
+
+  /* 按键按下：样本足够才采信，否则保留 0，并在串口报告实际样本数，
+     便于发现"上电后立刻发车、零偏没校准"的情况。 */
+  if (gyro_bias_count >= GYRO_BIAS_MIN_SAMPLES)
+    gyro_z_offset = gyro_bias_sum / (float)gyro_bias_count;
+
+  gyro_bias_latched = 1U;
+  printf("gyro,ofs,%ld,%lu\r\n",
+         (long)(gyro_z_offset * 1000.0f), (unsigned long)gyro_bias_count);
+}
+
+/* 停车后重新打开零偏校准窗口：等 GYRO_BIAS_SETTLE_MS 后再重新累积，
+   这样下次发车会用最新的静止读数求零偏，不必断电重启。 */
+static void GyroBias_Restart(void)
+{
+  gyro_bias_sum = 0.0f;
+  gyro_bias_count = 0U;
+  gyro_bias_ready = 0U;
+  gyro_bias_latched = 0U;
+  gyro_bias_tick = HAL_GetTick();
+  if (gyro_bias_tick == 0U)
+    gyro_bias_tick = 1U;
+}
+
 /* 将控制器状态清零，防止停机或丢线期间积分继续累积。 */
 static void VehicleControl_Reset(ControlLoopState *line_state,
                                  ControlLoopState *yaw_state,
@@ -318,6 +436,7 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   control_target_yaw_rate_dps = 0.0f;
   control_turn_pwm = 0.0f;
   control_base_pwm = 0.0f;
+  control_speed_target_mps = 0.0f;
   control_left_pwm = 0U;
   control_right_pwm = 0U;
 
@@ -339,6 +458,23 @@ static float Control_Clamp(float value, float minimum, float maximum)
   return value;
 }
 
+/* 死区补偿：把期望 PWM 线性映射到 [deadzone, CONTROL_MAX_PWM_CCR]。
+   占空比很小时也能真正驱动轮子，同时 pwm = 0 时输出仍为 0（可停车）。 */
+static uint16_t Motor_ApplyDeadzone(float pwm, float deadzone)
+{
+  float ccr;
+
+  if (pwm <= 0.0f)
+    return 0U;
+  if (deadzone <= 0.0f)
+    return (uint16_t)Control_Clamp(pwm, 0.0f, CONTROL_MAX_PWM_CCR);
+  if (deadzone >= CONTROL_MAX_PWM_CCR)
+    return (uint16_t)CONTROL_MAX_PWM_CCR;
+
+  ccr = deadzone + (pwm * (CONTROL_MAX_PWM_CCR - deadzone) / CONTROL_MAX_PWM_CCR);
+  return (uint16_t)Control_Clamp(ccr, 0.0f, CONTROL_MAX_PWM_CCR);
+}
+
 /*
  * 三级控制计算（每 10 ms 调用一次）：
  * 光电管位置 PD 生成目标偏航角速度，陀螺仪 PID 生成左右轮差速，
@@ -349,9 +485,13 @@ static void VehicleControl_Update(void)
   static ControlLoopState line_state;
   static ControlLoopState yaw_state;
   static ControlLoopState speed_state;
+  static uint16_t line_lost_ticks;
+  static uint16_t run_ticks;
+  static uint16_t stall_ticks;
   const float dt = (float)CONTROL_UPDATE_MS / 1000.0f;
   float line_error;
   float line_derivative;
+  float yaw_rate;
   float yaw_error;
   float yaw_derivative;
   float speed_error;
@@ -359,27 +499,66 @@ static void VehicleControl_Update(void)
   float left_pwm;
   float right_pwm;
 
-  /* 未按下发车键、光电管丢线或 IMU 未初始化时，不允许控制输出。 */
-  if ((run_button_started == 0U) ||
-      (line_sensor_valid == 0U) ||
-      (imu_ready == 0U))
+  /* 未按下发车键、IMU 未初始化或已记录故障时，不允许控制输出。 */
+  if ((run_button_started == 0U) || (imu_ready == 0U) ||
+      (control_fault != FAULT_NONE))
   {
+    line_lost_ticks = 0U;
+    run_ticks = 0U;
+    stall_ticks = 0U;
     VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
     return;
   }
 
-  /* 将循迹误差从千分之一权重还原为传感器权重。 */
-  line_error = (float)line_error_milli / (float)LINE_ERROR_SCALE;
-  line_derivative = line_state.initialized ?
-                    (line_error - line_state.previous_error) / dt : 0.0f;
+  /* 角速度数据过期：主循环被长时间阻塞或 SPI 卡死，此时不能用旧值继续闭环。 */
+  if ((uint32_t)(HAL_GetTick() - gyro_sample_tick) > GYRO_SAMPLE_TIMEOUT_MS)
+  {
+    control_fault = FAULT_IMU;
+    run_button_started = 0U;
+    VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+    return;
+  }
+
+  if (run_ticks < 0xFFFFU)
+    ++run_ticks;
+
+  if (line_sensor_valid == 0U)
+  {
+    /* 十字路口、虚线或飞线造成的短暂丢线：保持最后一次偏差继续盲开，
+       角速度环仍由陀螺仪闭环以维持航向；超时仍无信号才停机。 */
+    if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
+      ++line_lost_ticks;
+
+    if (line_lost_ticks >= LINE_LOST_HOLD_TICKS)
+    {
+      VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+      return;
+    }
+
+    /* 保持期间偏差不变，微分必须置 0，否则误差会持续累积 */
+    line_error = line_state.previous_error;
+    line_derivative = 0.0f;
+  }
+  else
+  {
+    /* 将循迹误差从千分之一权重还原为传感器权重。 */
+    line_error = (float)line_error_milli / (float)LINE_ERROR_SCALE;
+    /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
+    line_derivative = ((line_state.initialized != 0U) && (line_lost_ticks == 0U)) ?
+                      (line_error - line_state.previous_error) / dt : 0.0f;
+    line_lost_ticks = 0U;
+  }
   control_target_yaw_rate_dps = Control_Clamp(
       (LINE_PD_KP * line_error) + (LINE_PD_KD * line_derivative),
       -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
   line_state.previous_error = line_error;
   line_state.initialized = 1U;
 
-  /* 目标角速度与 BMI270 Z 轴角速度之差由 PID 转为左右轮差速量。 */
-  yaw_error = control_target_yaw_rate_dps - gyro_z;
+  /* 目标角速度与扣除零偏后的 BMI270 Z 轴角速度之差由 PID 转为左右轮差速量。 */
+  yaw_rate = gyro_z;
+  if ((yaw_rate < GYRO_DEADBAND_DPS) && (yaw_rate > -GYRO_DEADBAND_DPS))
+    yaw_rate = 0.0f;
+  yaw_error = control_target_yaw_rate_dps - yaw_rate;
   yaw_derivative = yaw_state.initialized ?
                    (yaw_error - yaw_state.previous_error) / dt : 0.0f;
   yaw_state.integral = Control_Clamp(yaw_state.integral + yaw_error * dt,
@@ -394,7 +573,22 @@ static void VehicleControl_Update(void)
 
   /* 平均左右轮速度与目标速度之差由 PI 转为公共基础 PWM。 */
   average_speed = (speed_left_mps + speed_right_mps) * 0.5f;
-  speed_error = CONTROL_TARGET_SPEED_MPS - average_speed;
+
+  /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。 */
+  if (control_speed_target_mps < CONTROL_TARGET_SPEED_MPS)
+  {
+    control_speed_target_mps += CONTROL_ACCEL_LIMIT_MPS2 * dt;
+    if (control_speed_target_mps > CONTROL_TARGET_SPEED_MPS)
+      control_speed_target_mps = CONTROL_TARGET_SPEED_MPS;
+  }
+  else if (control_speed_target_mps > CONTROL_TARGET_SPEED_MPS)
+  {
+    control_speed_target_mps -= CONTROL_ACCEL_LIMIT_MPS2 * dt;
+    if (control_speed_target_mps < CONTROL_TARGET_SPEED_MPS)
+      control_speed_target_mps = CONTROL_TARGET_SPEED_MPS;
+  }
+
+  speed_error = control_speed_target_mps - average_speed;
   speed_state.integral = Control_Clamp(speed_state.integral + speed_error * dt,
                                        -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
   control_base_pwm = Control_Clamp(
@@ -407,8 +601,9 @@ static void VehicleControl_Update(void)
                            0.0f, CONTROL_MAX_PWM_CCR);
   right_pwm = Control_Clamp(control_base_pwm + control_turn_pwm,
                             0.0f, CONTROL_MAX_PWM_CCR);
-  control_left_pwm = (uint16_t)left_pwm;
-  control_right_pwm = (uint16_t)right_pwm;
+  /* 死区补偿只作用于最终写进 CCR 的值，控制环内部仍用未补偿的 PWM。 */
+  control_left_pwm = Motor_ApplyDeadzone(left_pwm, MOTOR_DEADZONE_L);
+  control_right_pwm = Motor_ApplyDeadzone(right_pwm, MOTOR_DEADZONE_R);
 
   /* 电机输出需人工完成标定后才可启用；当前编译配置保持关闭。 */
   if (MOTOR_CONTROL_ENABLE != 0U)
@@ -418,9 +613,32 @@ static void VehicleControl_Update(void)
     TIM1->CCR1 = control_left_pwm;
     TIM1->CCR2 = control_right_pwm;
   }
+
+  /* 堵转保护：指令已超过起转占空比，两轮却都几乎不转，判定卡死并停机。
+     发车后留 MOTOR_RUN_GRACE_MS 的起步时间，避免把正常起步误判成卡死。 */
+  if ((MOTOR_CONTROL_ENABLE != 0U) && (run_ticks > MOTOR_GRACE_TICKS) &&
+      ((control_left_pwm >= MOTOR_STALL_PWM_MIN) ||
+       (control_right_pwm >= MOTOR_STALL_PWM_MIN)) &&
+      (average_speed < MOTOR_STALL_SPEED_MPS) &&
+      (average_speed > -MOTOR_STALL_SPEED_MPS))
+  {
+    if (stall_ticks < 0xFFFFU)
+      ++stall_ticks;
+    if (stall_ticks >= MOTOR_STALL_TICKS)
+    {
+      control_fault = FAULT_STALL;
+      run_button_started = 0U;
+      VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+    }
+  }
+  else
+  {
+    stall_ticks = 0U;
+  }
 }
 
-/* 非阻塞消抖：PB14 按下电平持续 20 ms 后锁存发车状态。 */
+/* 非阻塞消抖：PB14 按下电平持续 20 ms 后判定为一次按键，
+   每次按下在"发车 / 停车"之间切换。 */
 static void RunButton_Update(void)
 {
   static GPIO_PinState candidate_state = GPIO_PIN_SET;
@@ -442,9 +660,23 @@ static void RunButton_Update(void)
   {
     stable_state = raw_state;
 
-    /* 本项目按低电平按下处理；按键只设置状态，不启动任何动力输出。 */
-    if ((stable_state == RUN_BUTTON_PRESSED) && (run_button_started == 0U))
-      run_button_started = 1U;
+    /* 本项目按低电平按下处理。 */
+    if (stable_state == RUN_BUTTON_PRESSED)
+    {
+      if (run_button_started == 0U)
+      {
+        /* 重新发车：清故障码，零偏用停稳期间累积的样本重新校准。 */
+        control_fault = FAULT_NONE;
+        run_button_started = 1U;
+      }
+      else
+      {
+        /* 停车：控制环下一个 10 ms 节拍会清零 PWM 与积分，
+           同时重新打开零偏校准窗口，便于下次发车前重新测零偏。 */
+        run_button_started = 0U;
+        GyroBias_Restart();
+      }
+    }
   }
 }
 
@@ -465,6 +697,30 @@ void Init_brushless_motor(void)
       HAL_Delay(200);//等待无刷电桥负压启动完成
   /* Disabled fan: return immediately; DMA completes the existing
      0.9 ms -> 1.0 ms idle-signal sequence in the background. */
+}
+
+/* 独立看门狗直接用寄存器配置，不依赖 HAL_IWDG 驱动和 CubeMX 生成配置。
+   LSI 约 40 kHz，预分频 64 得到 625 Hz，重装值 499 约 0.8 s 超时。
+   IWDG 一旦启动无法关闭，调试阶段务必将 WATCHDOG_ENABLE 保持 0。 */
+static void Watchdog_Init(void)
+{
+#if WATCHDOG_ENABLE
+  IWDG->KR = 0xCCCCU;   /* 启动 IWDG */
+  IWDG->KR = 0x5555U;   /* 允许写 PR / RLR */
+  IWDG->PR = 0x04U;     /* LSI / 64 */
+  IWDG->RLR = 499U;     /* 约 0.8 s */
+  while (IWDG->SR != 0U)
+  {
+  }
+  IWDG->KR = 0xAAAAU;   /* 首次喂狗 */
+#endif
+}
+
+static void Watchdog_Feed(void)
+{
+#if WATCHDOG_ENABLE
+  IWDG->KR = 0xAAAAU;
+#endif
 }
 /**
  * @brief  The application entry point.
@@ -517,6 +773,7 @@ int main(void)
   {
     int8_t bmi_init_result = dodo_BMI270_init();
     imu_ready = (bmi_init_result == 0) ? 1U : 0U;
+    gyro_sample_tick = HAL_GetTick();
     if (imu_ready == 0U)
       printf("imu_init,fail,%d\r\n", (int)bmi_init_result);
   }
@@ -534,22 +791,39 @@ int main(void)
   // 延时5000秒，等待无刷电调初始化
   // TIM1->PSC = 0;
 
+  /* 看门狗最后启动：前面的初始化（含负压启动 2 s 等待）不受其超时约束。 */
+  Watchdog_Init();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    Watchdog_Feed();
     RunButton_Update();
 
-    /* 仅在首次确认按下后报告状态，供后续控制逻辑使用。 */
-    if (run_button_started != 0U)
+    /* 发车状态变化时报告一次：1 = 运行中，0 = 已停车。 */
     {
       static uint8_t run_state_reported;
-      if (run_state_reported == 0U)
+      if (run_state_reported != run_button_started)
       {
-        printf("run,1\r\n");
-        run_state_reported = 1U;
+        run_state_reported = run_button_started;
+        printf("run,%u\r\n", (unsigned int)run_state_reported);
+      }
+    }
+
+    /* 故障由控制环置位并已停机，这里只负责报告一次；故障清除后可再次报告。 */
+    {
+      static uint8_t fault_reported;
+      if (control_fault == FAULT_NONE)
+      {
+        fault_reported = FAULT_NONE;
+      }
+      else if (fault_reported != control_fault)
+      {
+        fault_reported = control_fault;
+        printf("fault,%u\r\n", (unsigned int)control_fault);
       }
     }
 
@@ -625,9 +899,15 @@ int main(void)
 #endif
     // 以下为陀螺仪使用示例
     dodo_BMI270_get_data();                         // 调用此函数会更新陀螺仪数据
+    gyro_sample_tick = HAL_GetTick();               // 控制环用它判断角速度数据是否过期
+    {
+      /* 原始 Z 轴角速度先参与零偏采样；扣除零偏并按安装方向修正后才送控制环。 */
+      float raw_gyro_z = BMI270_gyro_transition(BMI270_gyro_z);
+      GyroBias_Update(raw_gyro_z);
+      gyro_z = YAW_RATE_SIGN * (raw_gyro_z - gyro_z_offset);
+    }
     gyro_x = BMI270_gyro_transition(BMI270_gyro_x); // 将原始陀螺仪数据转换为物理值，单位为度每秒
     gyro_y = BMI270_gyro_transition(BMI270_gyro_y);
-    gyro_z = BMI270_gyro_transition(BMI270_gyro_z);
     accel_x = BMI270_acc_transition(BMI270_accel_x); // 将原始加速度计数据转换为物理值，单位为g，一般不需要使用此数据
     accel_y = BMI270_acc_transition(BMI270_accel_y);
     accel_z = BMI270_acc_transition(BMI270_accel_z);
