@@ -326,6 +326,15 @@ static volatile uint16_t line_sensor_bits;
 static volatile int16_t line_error_milli;
 /* 至少有一路传感器检测到白线时为 1；全无信号时为 0。 */
 static volatile uint8_t line_sensor_valid;
+/* 光电管极性自动判定结果：1 表示实际输出与 LINE_SENSOR_ACTIVE_LEVEL 相反。
+   上电后、发车前自动判定一次，避免"极性反了导致车往线的反方向跑"。 */
+static uint8_t line_polarity_inverted;
+static uint8_t line_polarity_locked;
+static uint16_t line_polarity_votes;
+static uint16_t line_polarity_ok_votes;
+static uint16_t line_polarity_total;
+/* 循迹方向修正：lsg=-1 可在线翻转，用于排查"越偏越往外打"的情况。 */
+static volatile float tune_line_sign = 1.0f;
 
 /* 发车键每按一次在"待发车"和"运行中"之间切换：1 表示运行中。 */
 static volatile uint8_t run_button_started;
@@ -443,13 +452,79 @@ static void LineSensor_Update(void)
   uint16_t active_count = 0U;
   int32_t weighted_position = 0;
   uint16_t channel;
+  uint8_t active_level = LINE_SENSOR_ACTIVE_LEVEL;
 
   MUX_get_value(&sensor_bits);
   line_sensor_bits = sensor_bits;
 
+  /* 极性自动判定（上电后、发车前判定一次，之后锁定）：
+     悬空或压在线上时，12 路里正常最多只有 1~3 路处于"压线"电平；
+     若超过一半通道都落在 probe_level 上，说明 LINE_SENSOR_ACTIVE_LEVEL 与实际电平相反。
+     判定结果会打印 line,pol,0/1，可用 pol 命令（通道 17）强制改写或重新判定。 */
+  if ((run_button_started == 0U) && (line_polarity_locked == 0U))
+  {
+    uint16_t raw_active = 0U;
+    uint8_t probe_level = LINE_SENSOR_ACTIVE_LEVEL;
+
+    if (line_polarity_inverted != 0U)
+      probe_level = (probe_level == 0U) ? 1U : 0U;
+
+    for (channel = 0U; channel < MULTIPLEXER_CHANNEL_NUM; ++channel)
+    {
+      if (MUX_GET_CHANNEL(sensor_bits, channel) == probe_level)
+        ++raw_active;
+    }
+
+    if (raw_active > (MULTIPLEXER_CHANNEL_NUM / 2U))
+    {
+      line_polarity_ok_votes = 0U;
+      if (line_polarity_votes < 30U)
+        ++line_polarity_votes;
+    }
+    else
+    {
+      line_polarity_votes = 0U;
+      if (line_polarity_ok_votes < 50U)
+        ++line_polarity_ok_votes;
+    }
+
+    if (line_polarity_votes >= 30U)
+    {
+      line_polarity_inverted = (line_polarity_inverted != 0U) ? 0U : 1U;
+      line_polarity_locked = 1U;
+      printf("line,pol,%u\r\n", (unsigned int)line_polarity_inverted);
+    }
+    else if (line_polarity_ok_votes >= 50U)
+    {
+      line_polarity_locked = 1U;
+      printf("line,pol,%u\r\n", (unsigned int)line_polarity_inverted);
+    }
+    else
+    {
+      /* 3 秒内读不到稳定状态（例如传感器对空或背景反光不均）就按当前极性锁定 */
+      if (line_polarity_total < 400U)
+        ++line_polarity_total;
+      if (line_polarity_total >= 300U)
+      {
+        line_polarity_locked = 1U;
+        printf("line,pol,%u\r\n", (unsigned int)line_polarity_inverted);
+      }
+      else
+      {
+        /* 判定期间不输出循迹量，避免误用未定极性的数据 */
+        line_error_milli = 0;
+        line_sensor_valid = 0U;
+        return;
+      }
+    }
+  }
+
+  if (line_polarity_inverted != 0U)
+    active_level = (active_level == 0U) ? 1U : 0U;
+
   for (channel = 0U; channel < MULTIPLEXER_CHANNEL_NUM; ++channel)
   {
-    if (MUX_GET_CHANNEL(sensor_bits, channel) == LINE_SENSOR_ACTIVE_LEVEL)
+    if (MUX_GET_CHANNEL(sensor_bits, channel) == active_level)
     {
       /* 按教程采用左侧 -6 至 -1、右侧 +1 至 +6 的循迹权重。 */
       int32_t weight = (channel < 6U) ? ((int32_t)channel - 6L) : ((int32_t)channel - 5L);
@@ -552,7 +627,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -579,6 +654,21 @@ static void Tune_ApplyParameter(uint8_t index, float value)
     case 13U: tune_yaw_sign   = (value < 0.0f) ? -1.0f : 1.0f; break;
     case 14U: tune_gyro_trim  = value; break;
     case 15U: tune_yaw_ff     = value; break;
+    case 16U: tune_line_sign  = (value < 0.0f) ? -1.0f : 1.0f; break;
+    case 17U: /* 光电管极性：pol=0/1 强制指定，pol=-1 清除锁定、重新自动判定 */
+      line_polarity_votes = 0U;
+      line_polarity_ok_votes = 0U;
+      line_polarity_total = 0U;
+      if (value < 0.0f)
+      {
+        line_polarity_locked = 0U;
+      }
+      else
+      {
+        line_polarity_inverted = (value < 0.5f) ? 0U : 1U;
+        line_polarity_locked = 1U;
+      }
+      break;
     default:  return;
   }
   printf("set,%u,%ld\r\n", (unsigned int)index, (long)(value * 1000.0f));
@@ -700,6 +790,7 @@ static void Tune_SetDefaults(void)
   tune_yaw_sign     = YAW_RATE_SIGN;
   tune_gyro_trim    = GYRO_TRIM_DPS;
   tune_yaw_ff       = YAW_DIFF_FF_MPS_PER_DPS;
+  tune_line_sign    = 1.0f;
   tune_stall_enable = 1U;
 }
 
@@ -815,7 +906,7 @@ static void Tune_PrintAll(void)
 {
   /* 单行紧凑输出：便于在滚动日志里一眼看全，也方便整行复制。
      数值统一 ×1000，例如 spd 显示 700 表示 0.700。 */
-  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u,ysg=%ld,ofs=%ld,yff=%ld\r\n",
+  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u,ysg=%ld,ofs=%ld,yff=%ld,lsg=%ld,pol=%u\r\n",
          (long)(tune_line_kp * 1000.0f),
          (long)(tune_line_kd * 1000.0f),
          (long)(tune_yaw_kp * 1000.0f),
@@ -830,7 +921,9 @@ static void Tune_PrintAll(void)
          (unsigned int)tune_stall_enable,
          (long)tune_yaw_sign,
          (long)(tune_gyro_trim * 1000.0f),
-         (long)(tune_yaw_ff * 1000000.0f));
+         (long)(tune_yaw_ff * 1000000.0f),
+         (long)tune_line_sign,
+         (unsigned int)line_polarity_inverted);
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -922,7 +1015,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 15U; ++k)
+  for (k = 0U; k < 17U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1172,7 +1265,7 @@ static void VehicleControl_Update(void)
   else
   {
     /* 将循迹误差从千分之一权重还原为传感器权重。 */
-    line_error = (float)line_error_milli / (float)LINE_ERROR_SCALE;
+    line_error = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
     /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
     line_derivative = ((line_state.initialized != 0U) && (line_lost_ticks == 0U)) ?
                       (line_error - line_state.previous_error) / dt : 0.0f;
@@ -1376,6 +1469,12 @@ static void RunButton_Update(void)
       {
         /* 重新发车：清故障码，零偏用停稳期间累积的样本重新校准。 */
         control_fault = FAULT_NONE;
+        /* 若极性自动判定还没完成，就以当前结果锁定，避免发车后一直无有效循迹量 */
+        if (line_polarity_locked == 0U)
+        {
+          line_polarity_locked = 1U;
+          printf("line,pol,%u\r\n", (unsigned int)line_polarity_inverted);
+        }
         run_button_started = 1U;
       }
       else
