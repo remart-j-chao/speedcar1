@@ -46,29 +46,35 @@
    MOTOR_TEST_CCR 即 TIM1 通道比较值，占空比 = CCR / (Period + 1) = CCR / 7200，
    800 约占 11.1%。 */
 #define MOTOR_TEST             0
-#define MOTOR_TEST_CCR        700U
-#define MOTOR_TEST_R_CCR       600U
+#define MOTOR_TEST_CCR         310U
+#define MOTOR_TEST_R_CCR       300U
 #define MOTOR_TEST_RUN_MS      3000U
 /* 前进时的方向脚电平。若某个轮子反转，把对应的一行改成 GPIO_PIN_RESET。 */
 #define L_DIR_FORWARD          GPIO_PIN_RESET
 #define R_DIR_FORWARD          GPIO_PIN_SET
 
-/* ---------------- 编码器测速参数（按实际硬件标定） ----------------
-   车轮每转一圈计数 = ENCODER_LINES × 4（TI12 四倍频）× ENCODER_GEAR_RATIO
-   手推车轮转一圈，累计计数应接近这个值，否则说明线数/传动比填错。
-   13 线霍尔直接装车轮轴时一圈只有 52 个计数，10 ms 内只有个位数的计数，
-   所以速度用 SPEED_AVG_SAMPLES 个采样做滑动平均，窗口 10 × 10 ms = 100 ms。 */
-#define ENCODER_LINES         13.0f     /* 编码器单相每转脉冲数 */
-#define ENCODER_GEAR_RATIO    1.0f      /* 编码器轴到车轮的传动比：直接装在车轮轴上取 1.0 */
-#define WHEEL_DIAMETER_M      0.065f    /* 车轮直径，单位 m */
+/* ---------------- 编码器标定（按实际硬件实测） ----------------
+   速度换算只依赖“每米计数”这一个标定值，不要再用
+   线数 × 4 × 传动比 ÷ 轮周长 去推算：三个参数任一估错，结果会差好几倍。
+   本项目实测约 3.77 万计数/米，比“编码器直连车轮”的假设大 148 倍。
+
+   标定方法：
+   1) 上电后按一次发车键（odom 清零）
+   2) 沿直线推行恰好 1 m
+   3) 读串口最后一行 odom 的两个数值，取平均即为每米计数
+   4) 把结果填入 ENCODER_COUNTS_PER_METER，重新编译 */
+#define ENCODER_COUNTS_PER_METER  37385.0f
 #define SPEED_SAMPLE_MS       10U       /* 采样周期，单位 ms（TIM2 为 1 kHz 时基） */
-#define SPEED_AVG_SAMPLES     10U       /* 滑动平均窗长（样本数），10 × 10 ms = 100 ms */
+#define SPEED_AVG_SAMPLES     3U        /* 滑动平均窗长（样本数），3 × 10 ms = 30 ms。
+                                           窗口越长速度越平滑但滞后越大：100 ms 窗口配 10 ms
+                                           控制周期会让速度环"拿旧数据做快速决策"，表现为一顿一顿。
+                                           3.7 万计数/米下 30 ms 已有 400+ 计数，精度足够。 */
 #define SPEED_WINDOW_MS       (SPEED_SAMPLE_MS * SPEED_AVG_SAMPLES)
 #define ENC_L_SIGN            1         /* 左轮计数方向修正，前进计数为正时保持 1 */
 #define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
 
 /* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
-#define LINE_SENSOR_ACTIVE_LEVEL 1U
+#define LINE_SENSOR_ACTIVE_LEVEL 0U
 #define LINE_SAMPLE_MS          10U
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
@@ -77,10 +83,10 @@
 #define RUN_BUTTON_PRESSED      GPIO_PIN_RESET
 
 /* 控制器只在完成实车标定后启用；0 表示不向电机 PWM 写入控制量。 */
-#define MOTOR_CONTROL_ENABLE       0U
+#define MOTOR_CONTROL_ENABLE       1U
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
 /* 速度环目标，起步标定值。若为 0，速度误差恒为负，基础 PWM 会被钳在 0 而无法起步。 */
-#define CONTROL_TARGET_SPEED_MPS   0.25f
+#define CONTROL_TARGET_SPEED_MPS   0.7f
 #define CONTROL_MAX_PWM_CCR        700.0f
 #define CONTROL_MAX_YAW_RATE_DPS   180.0f
 
@@ -105,8 +111,8 @@
 
 /* 实测起转 CCR（死区）：低于该占空比轮子不转。填 0 表示不做死区补偿。
    标定方法：逐级加大 CCR，记录轮子刚开始转动的最小值，左右轮分别填。 */
-#define MOTOR_DEADZONE_L           0.0f
-#define MOTOR_DEADZONE_R           0.0f
+#define MOTOR_DEADZONE_L           310.0f
+#define MOTOR_DEADZONE_R           300.0f
 
 /* 堵转保护：指令 PWM 已超过该值、两轮速度都接近 0 并持续一段时间，判定卡死停机。 */
 #define MOTOR_STALL_PWM_MIN        200U
@@ -123,6 +129,17 @@
 #define FAULT_NONE                 0U
 #define FAULT_STALL                1U
 #define FAULT_IMU                  2U
+#define FAULT_DIR                  3U
+
+/* 故障瞬间的快照，供主循环打印，避免在中断里直接 printf。 */
+static volatile int32_t fault_speed_l_mmps;
+static volatile int32_t fault_speed_r_mmps;
+static volatile uint16_t fault_ccr_l;
+static volatile uint16_t fault_ccr_r;
+
+/* 编码器方向接反时每个轮子的速度环会正反馈失控（指令正向、测到反向 → 输出越给越大），
+   所以一旦在正向目标下测到持续反向速度就立即停机。 */
+#define MOTOR_REVERSE_SPEED_MPS    (-0.05f)
 
 /* 独立看门狗：1 表示启用（LSI 约 40 kHz、超时约 0.8 s）。
    一旦启动无法关闭，调试器停在断点会触发复位，调试阶段保持 0。 */
@@ -134,20 +151,35 @@
 #define YAW_PID_KP                 0.0f  /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
-#define SPEED_PI_KP                0.0f  /* 基础 PWM / 速度误差 */
-#define SPEED_PI_KI                0.0f  /* 基础 PWM / 速度误差积分 */
+#define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
+#define SPEED_PI_KI                120.0f  /* 基础 PWM / 速度误差积分（为 0 时靠 P 撑不住稳态，必抖） */
+/* 速度前馈：base 先按目标速度给一个开环油门，PI 只负责修正残差。
+   没有前馈时积分要从 0 慢慢爬上去（实测 20 s 才到目标的一半），
+   而且积分限幅太小会永远到不了目标速度。 */
+#define SPEED_FF_PWM_PER_MPS       550.0f  /* 基础 PWM / (m/s)，按实测标定 */
 #define YAW_INTEGRAL_LIMIT         500.0f
-#define SPEED_INTEGRAL_LIMIT       2.0f
+#define SPEED_INTEGRAL_LIMIT       5.0f
+
+/* ---------------- 在线整定（逐飞助手 / 无线串口） ----------------
+   上面这些增益与死区在运行时可被串口改写，断电后恢复为宏里的值。
+   改到满意的数值后，把它写回对应宏并重新编译即可固化。 */
+#define TUNE_ENABLE                1
+#define TUNE_RX_BUFFER_SIZE        256U
+#define TUNE_LINE_MAX              40U
+/* 部分串口工具默认不发送换行符，此时按“空闲超时”收尾，
+   避免整行一直等不到 \r\n 而毫无反应。 */
+#define TUNE_LINE_IDLE_MS          150U
 
 /* 一个滑动窗口内的计数之和对应的车轮线速度，单位 m/s，编译期常量 */
 #define ENC_COUNTS_TO_MPS \
-  ((3.14159265f * WHEEL_DIAMETER_M) / \
-   (ENCODER_LINES * 4.0f * ENCODER_GEAR_RATIO) * (1000.0f / (float)SPEED_WINDOW_MS))
+  ((1000.0f / (float)SPEED_WINDOW_MS) / ENCODER_COUNTS_PER_METER)
 
 /* 测速结果打印开关。以整数 mm/s 输出，不引入额外的浮点 printf 代码。 */
 #define SPEED_DEBUG            1
 #define SPEED_PRINT_MS         100U
 #define GYRO_PRINT_MS          100U
+/* 累计计数打印周期，标定每米计数时用来读取总计数。 */
+#define ODOM_PRINT_MS          200U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -255,6 +287,11 @@ static uint16_t enc_hist_index;
 static int32_t  enc_left_sum;
 static int32_t  enc_right_sum;
 
+/* 累计计数，用于标定“每米计数”。按一次发车键清零，
+   直接对每次 10 ms 增量累加，不受调试打印降采样（100 ms）影响。 */
+static volatile int32_t odom_left;
+static volatile int32_t odom_right;
+
 /* 循迹状态：通道 0 在最左侧，通道 11 在最右侧。 */
 static volatile uint16_t line_sensor_bits;
 /* 偏差单位为千分之一传感器权重，左偏为负，右偏为正。 */
@@ -290,6 +327,35 @@ static volatile float control_base_pwm;
 static volatile uint16_t control_left_pwm;
 static volatile uint16_t control_right_pwm;
 
+/* 可在线整定的参数：上电取自宏，运行中由串口命令 / 逐飞助手改写。
+   控制环在 TIM2 中断里读取，所以用 volatile；32 位对齐写天然原子，无需加锁。 */
+static volatile float tune_line_kp      = LINE_PD_KP;
+static volatile float tune_line_kd      = LINE_PD_KD;
+static volatile float tune_yaw_kp       = YAW_PID_KP;
+static volatile float tune_yaw_ki       = YAW_PID_KI;
+static volatile float tune_yaw_kd       = YAW_PID_KD;
+static volatile float tune_speed_kp     = SPEED_PI_KP;
+static volatile float tune_speed_ki     = SPEED_PI_KI;
+static volatile float tune_speed_ff     = SPEED_FF_PWM_PER_MPS;
+static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
+static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
+static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
+/* 堵转保护开关：台架/调参时可用 stl=0 关闭，避免车轮不转就自动停机。 */
+static volatile uint8_t tune_stall_enable = 1U;
+
+/* 周期性调试打印的运行时开关：串口发 q 静音、发 v 恢复。
+   静音时仍保留 run / fault / set / show 等事件性输出，
+   这样调参回复不会被 line / enc / ctrl / gyro 每 100 ms 的刷屏冲掉。 */
+static volatile uint8_t debug_print_on = 1U;
+
+#if TUNE_ENABLE
+/* USART3 接收环形缓冲：中断里只做入队，解析放在主循环，避免阻塞。 */
+static uint8_t tune_rx_buffer[TUNE_RX_BUFFER_SIZE];
+static volatile uint16_t tune_rx_head;
+static volatile uint16_t tune_rx_tail;
+static uint8_t tune_rx_byte;
+#endif
+
 typedef struct
 {
   float integral;
@@ -315,6 +381,10 @@ static void LineSensor_Update(void);
 static void RunButton_Update(void);
 static void GyroBias_Update(float raw_gyro_z);
 static void VehicleControl_Update(void);
+#if TUNE_ENABLE
+static void Tune_Update(void);
+static void Tune_PrintAll(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -418,10 +488,308 @@ static void GyroBias_Restart(void)
     gyro_bias_tick = 1U;
 }
 
+#if TUNE_ENABLE
+/* ---------------- 在线整定：串口协议 ----------------
+   两条路都走 USART3（有线调试线与无线串口模块共用这组收发脚）：
+
+   A. 逐飞助手「参数设置」面板
+      下发帧：0x55 0x20 通道 校验 4 字节 float（小端），通道 1~10。
+      校验字节只接收不比对，因此不依赖上位机的具体校验算法。
+
+   B. 纯文本命令（逐飞助手「串口助手」或任意串口工具，末尾回车换行）
+        lkp=10    循迹 Kp        lkd=0    循迹 Kd
+        ykp=100   角速度 Kp      yki=0    角速度 Ki      ykd=0  角速度 Kd
+        skp=800   速度 Kp        ski=200  速度 Ki
+        spd=0.4   目标速度 m/s
+        dzl=450   dzr=470       左右轮死区 CCR
+        show      打印当前全部参数
+   参数不写 Flash，断电恢复宏值；调满意后把数值写回对应宏再编译。 */
+
+static const char *const tune_names[] =
+{
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl"
+};
+
+/* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
+static void Tune_ApplyParameter(uint8_t index, float value)
+{
+  /* 挡住串口噪声造成的 NaN/INF 与离谱数值 */
+  if (!((value == value) && (value > -1000000.0f) && (value < 1000000.0f)))
+    return;
+
+  switch (index)
+  {
+    case 1U:  tune_line_kp      = value; break;
+    case 2U:  tune_line_kd      = value; break;
+    case 3U:  tune_yaw_kp       = value; break;
+    case 4U:  tune_yaw_ki       = value; break;
+    case 5U:  tune_yaw_kd       = value; break;
+    case 6U:  tune_speed_kp     = value; break;
+    case 7U:  tune_speed_ki     = value; break;
+    case 8U:  tune_target_speed = value; break;
+    case 9U:  tune_deadzone_l   = value; break;
+    case 10U: tune_deadzone_r   = value; break;
+    case 11U: tune_speed_ff     = value; break;
+    case 12U: tune_stall_enable = (value != 0.0f) ? 1U : 0U; break;
+    default:  return;
+  }
+  printf("set,%u,%ld\r\n", (unsigned int)index, (long)(value * 1000.0f));
+}
+
+/* 数值解析：只支持简单的十进制，避免引入 strtof 的浮点库开销。 */
+static float Tune_ParseValue(const char *s, uint8_t len, uint8_t *ok)
+{
+  float value = 0.0f;
+  float scale = 0.1f;
+  uint8_t i = 0U;
+  uint8_t negative = 0U;
+  uint8_t digits = 0U;
+  uint8_t after_dot = 0U;
+
+  *ok = 0U;
+  while ((i < len) && ((s[i] == ' ') || (s[i] == '\t')))
+    ++i;
+
+  if ((i < len) && ((s[i] == '-') || (s[i] == '+')))
+  {
+    negative = (s[i] == '-') ? 1U : 0U;
+    ++i;
+  }
+
+  for (; i < len; ++i)
+  {
+    if ((s[i] >= '0') && (s[i] <= '9'))
+    {
+      if (after_dot == 0U)
+      {
+        value = (value * 10.0f) + (float)(s[i] - '0');
+      }
+      else
+      {
+        value += (float)(s[i] - '0') * scale;
+        scale *= 0.1f;
+      }
+      ++digits;
+    }
+    else if ((s[i] == '.') && (after_dot == 0U))
+    {
+      after_dot = 1U;
+    }
+    else if ((s[i] == ' ') || (s[i] == '\t'))
+    {
+      continue;
+    }
+    else
+    {
+      return 0.0f;
+    }
+  }
+
+  *ok = (digits > 0U) ? 1U : 0U;
+  return (negative != 0U) ? -value : value;
+}
+
+static void Tune_PrintAll(void)
+{
+  /* 单行紧凑输出：便于在滚动日志里一眼看全，也方便整行复制。
+     数值统一 ×1000，例如 spd 显示 700 表示 0.700。 */
+  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u\r\n",
+         (long)(tune_line_kp * 1000.0f),
+         (long)(tune_line_kd * 1000.0f),
+         (long)(tune_yaw_kp * 1000.0f),
+         (long)(tune_yaw_ki * 1000.0f),
+         (long)(tune_yaw_kd * 1000.0f),
+         (long)(tune_speed_kp * 1000.0f),
+         (long)(tune_speed_ki * 1000.0f),
+         (long)(tune_speed_ff * 1000.0f),
+         (long)(tune_target_speed * 1000.0f),
+         (long)(tune_deadzone_l * 1000.0f),
+         (long)(tune_deadzone_r * 1000.0f),
+         (unsigned int)tune_stall_enable);
+}
+
+/* 比较 line 的前 len 个字符是否恰好等于 name */
+static uint8_t Tune_NameMatch(const char *line, uint8_t len, const char *name)
+{
+  uint8_t i;
+
+  for (i = 0U; i < len; ++i)
+  {
+    if ((name[i] == '\0') || (line[i] != name[i]))
+      return 0U;
+  }
+  return (name[len] == '\0') ? 1U : 0U;
+}
+
+static void Tune_ExecuteLine(const char *line, uint8_t len)
+{
+  uint8_t name_len = 0U;
+  uint8_t offset;
+  uint8_t ok = 0U;
+  uint8_t k;
+  float value;
+
+  while ((len > 0U) && ((line[0] == ' ') || (line[0] == '\t')))
+  {
+    ++line;
+    --len;
+  }
+  while ((len > 0U) && ((line[len - 1U] == ' ') || (line[len - 1U] == '\t')))
+    --len;
+  if (len == 0U)
+    return;
+
+  if ((Tune_NameMatch(line, len, "show") != 0U) ||
+      (Tune_NameMatch(line, len, "?") != 0U))
+  {
+    Tune_PrintAll();
+    return;
+  }
+
+  /* 静音 / 恢复周期性调试打印：调参时先 q，回显就只剩 set / cfg / err。 */
+  if ((Tune_NameMatch(line, len, "q") != 0U) ||
+      (Tune_NameMatch(line, len, "quiet") != 0U) ||
+      (Tune_NameMatch(line, len, "off") != 0U))
+  {
+    debug_print_on = 0U;
+    printf("dbg,off\r\n");
+    return;
+  }
+  if ((Tune_NameMatch(line, len, "v") != 0U) ||
+      (Tune_NameMatch(line, len, "verbose") != 0U) ||
+      (Tune_NameMatch(line, len, "on") != 0U))
+  {
+    debug_print_on = 1U;
+    printf("dbg,on\r\n");
+    return;
+  }
+
+  /* 名字部分到 '=' 或空格为止，例如 lkp=10 / lkp 10 */
+  while ((name_len < len) && (line[name_len] != '=') && (line[name_len] != ' '))
+    ++name_len;
+
+  offset = name_len;
+  while ((offset < len) && ((line[offset] == '=') || (line[offset] == ' ')))
+    ++offset;
+
+  value = Tune_ParseValue(&line[offset], (uint8_t)(len - offset), &ok);
+  if (ok == 0U)
+  {
+    printf("err,value\r\n");
+    return;
+  }
+
+  for (k = 0U; k < 12U; ++k)
+  {
+    if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
+    {
+      Tune_ApplyParameter((uint8_t)(k + 1U), value);
+      return;
+    }
+  }
+
+  printf("err,name\r\n");
+}
+
+/* 主循环调用：把中断收进来的字节流分帧解析。空闲时开销只是一次队列判断。 */
+static void Tune_Update(void)
+{
+  static char line[TUNE_LINE_MAX];
+  static uint8_t line_len;
+  static uint32_t line_tick;
+  static uint8_t frame_state;      /* 0=文本 1=收到 0x55 2=等功能字 3=通道 4=校验 5..8=float */
+  static uint8_t frame_index;
+  static uint8_t frame_channel;
+  static uint8_t frame_bytes[4];
+  uint8_t byte;
+
+  while (tune_rx_tail != tune_rx_head)
+  {
+    byte = tune_rx_buffer[tune_rx_tail];
+    tune_rx_tail = (uint16_t)((tune_rx_tail + 1U) % TUNE_RX_BUFFER_SIZE);
+
+    if (frame_state != 0U)
+    {
+      if (frame_state == 1U)
+      {
+        if (byte == 0x20U)
+        {
+          frame_state = 2U;
+        }
+        else if (byte != 0x55U)
+        {
+          frame_state = 0U;
+        }
+        continue;
+      }
+      if (frame_state == 2U)
+      {
+        frame_channel = byte;
+        frame_state = 3U;
+        continue;
+      }
+      if (frame_state == 3U)
+      {
+        frame_state = 4U;           /* 校验字节只接收不比对 */
+        continue;
+      }
+
+      frame_bytes[frame_index] = byte;
+      if (++frame_index >= 4U)
+      {
+        float value;
+        uint8_t *raw = (uint8_t *)&value;
+
+        raw[0] = frame_bytes[0];
+        raw[1] = frame_bytes[1];
+        raw[2] = frame_bytes[2];
+        raw[3] = frame_bytes[3];
+        Tune_ApplyParameter(frame_channel, value);
+
+        frame_state = 0U;
+        frame_index = 0U;
+      }
+      continue;
+    }
+
+    if (byte == 0x55U)
+    {
+      frame_state = 1U;
+      continue;
+    }
+    if ((byte == '\r') || (byte == '\n'))
+    {
+      if (line_len > 0U)
+      {
+        Tune_ExecuteLine(line, line_len);
+        line_len = 0U;
+      }
+      continue;
+    }
+    if ((byte >= 0x20U) && (byte < 0x7FU))
+    {
+      if (line_len < TUNE_LINE_MAX)
+        line[line_len++] = (char)byte;
+      line_tick = HAL_GetTick();
+      continue;
+    }
+    line_len = 0U;                  /* 非法字节，丢弃当前行 */
+  }
+
+  /* 没有换行符时按空闲超时收尾：等效于“发送完整命令后稍等即执行”。 */
+  if ((line_len > 0U) && ((HAL_GetTick() - line_tick) >= TUNE_LINE_IDLE_MS))
+  {
+    Tune_ExecuteLine(line, line_len);
+    line_len = 0U;
+  }
+}
+#endif /* TUNE_ENABLE */
+
 /* 将控制器状态清零，防止停机或丢线期间积分继续累积。 */
 static void VehicleControl_Reset(ControlLoopState *line_state,
                                  ControlLoopState *yaw_state,
-                                 ControlLoopState *speed_state)
+                                 ControlLoopState *speed_left_state,
+                                 ControlLoopState *speed_right_state)
 {
   line_state->integral = 0.0f;
   line_state->previous_error = 0.0f;
@@ -429,9 +797,12 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   yaw_state->integral = 0.0f;
   yaw_state->previous_error = 0.0f;
   yaw_state->initialized = 0U;
-  speed_state->integral = 0.0f;
-  speed_state->previous_error = 0.0f;
-  speed_state->initialized = 0U;
+  speed_left_state->integral = 0.0f;
+  speed_left_state->previous_error = 0.0f;
+  speed_left_state->initialized = 0U;
+  speed_right_state->integral = 0.0f;
+  speed_right_state->previous_error = 0.0f;
+  speed_right_state->initialized = 0U;
 
   control_target_yaw_rate_dps = 0.0f;
   control_turn_pwm = 0.0f;
@@ -484,7 +855,8 @@ static void VehicleControl_Update(void)
 {
   static ControlLoopState line_state;
   static ControlLoopState yaw_state;
-  static ControlLoopState speed_state;
+  static ControlLoopState speed_left_state;
+  static ControlLoopState speed_right_state;
   static uint16_t line_lost_ticks;
   static uint16_t run_ticks;
   static uint16_t stall_ticks;
@@ -494,10 +866,20 @@ static void VehicleControl_Update(void)
   float yaw_rate;
   float yaw_error;
   float yaw_derivative;
-  float speed_error;
+  float speed_error_left;
+  float speed_error_right;
+  float speed_ff_pwm;
+  float base_left_pwm;
+  float base_right_pwm;
   float average_speed;
   float left_pwm;
   float right_pwm;
+
+#if MOTOR_TEST
+  /* 试跑测试直接占用 CCR，若控制器继续运行会每 10 ms 把它清零，
+     表现为“给多少占空比都不转”。测试期间完全让出控制权。 */
+  return;
+#endif
 
   /* 未按下发车键、IMU 未初始化或已记录故障时，不允许控制输出。 */
   if ((run_button_started == 0U) || (imu_ready == 0U) ||
@@ -506,7 +888,7 @@ static void VehicleControl_Update(void)
     line_lost_ticks = 0U;
     run_ticks = 0U;
     stall_ticks = 0U;
-    VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+    VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
     return;
   }
 
@@ -515,7 +897,7 @@ static void VehicleControl_Update(void)
   {
     control_fault = FAULT_IMU;
     run_button_started = 0U;
-    VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+    VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
     return;
   }
 
@@ -531,7 +913,7 @@ static void VehicleControl_Update(void)
 
     if (line_lost_ticks >= LINE_LOST_HOLD_TICKS)
     {
-      VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+      VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
       return;
     }
 
@@ -549,7 +931,7 @@ static void VehicleControl_Update(void)
     line_lost_ticks = 0U;
   }
   control_target_yaw_rate_dps = Control_Clamp(
-      (LINE_PD_KP * line_error) + (LINE_PD_KD * line_derivative),
+      (tune_line_kp * line_error) + (tune_line_kd * line_derivative),
       -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
   line_state.previous_error = line_error;
   line_state.initialized = 1U;
@@ -564,46 +946,82 @@ static void VehicleControl_Update(void)
   yaw_state.integral = Control_Clamp(yaw_state.integral + yaw_error * dt,
                                      -YAW_INTEGRAL_LIMIT, YAW_INTEGRAL_LIMIT);
   control_turn_pwm = Control_Clamp(
-      (YAW_PID_KP * yaw_error) +
-      (YAW_PID_KI * yaw_state.integral) +
-      (YAW_PID_KD * yaw_derivative),
+      (tune_yaw_kp * yaw_error) +
+      (tune_yaw_ki * yaw_state.integral) +
+      (tune_yaw_kd * yaw_derivative),
       -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   yaw_state.previous_error = yaw_error;
   yaw_state.initialized = 1U;
 
-  /* 平均左右轮速度与目标速度之差由 PI 转为公共基础 PWM。 */
+  /* 左右轮各自一套速度 PI：两侧电机、减速箱、摩擦不可能完全一致，
+     共用一个 base 时偏弱的一侧会一直慢，车就会持续往一侧偏。
+     分开闭环后每个轮子都各自跟到目标速度，直道自然走正。 */
   average_speed = (speed_left_mps + speed_right_mps) * 0.5f;
 
-  /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。 */
-  if (control_speed_target_mps < CONTROL_TARGET_SPEED_MPS)
+  /* 方向保护：目标速度为正时两轮平均速度却持续为负，说明编码器方向接反。 */
+  if ((run_ticks > MOTOR_GRACE_TICKS) && (tune_target_speed > 0.05f) &&
+      (average_speed < MOTOR_REVERSE_SPEED_MPS))
   {
-    control_speed_target_mps += CONTROL_ACCEL_LIMIT_MPS2 * dt;
-    if (control_speed_target_mps > CONTROL_TARGET_SPEED_MPS)
-      control_speed_target_mps = CONTROL_TARGET_SPEED_MPS;
-  }
-  else if (control_speed_target_mps > CONTROL_TARGET_SPEED_MPS)
-  {
-    control_speed_target_mps -= CONTROL_ACCEL_LIMIT_MPS2 * dt;
-    if (control_speed_target_mps < CONTROL_TARGET_SPEED_MPS)
-      control_speed_target_mps = CONTROL_TARGET_SPEED_MPS;
+    control_fault = FAULT_DIR;
+    run_button_started = 0U;
+    VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
+    return;
   }
 
-  speed_error = control_speed_target_mps - average_speed;
-  speed_state.integral = Control_Clamp(speed_state.integral + speed_error * dt,
-                                       -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
-  control_base_pwm = Control_Clamp(
-      (SPEED_PI_KP * speed_error) + (SPEED_PI_KI * speed_state.integral),
+  /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
+     目标值可在运行中改（在线整定），这里取一次快照保证本轮一致。 */
+  {
+    const float speed_target = tune_target_speed;
+
+    if (control_speed_target_mps < speed_target)
+    {
+      control_speed_target_mps += CONTROL_ACCEL_LIMIT_MPS2 * dt;
+      if (control_speed_target_mps > speed_target)
+        control_speed_target_mps = speed_target;
+    }
+    else if (control_speed_target_mps > speed_target)
+    {
+      control_speed_target_mps -= CONTROL_ACCEL_LIMIT_MPS2 * dt;
+      if (control_speed_target_mps < speed_target)
+        control_speed_target_mps = speed_target;
+    }
+  }
+
+  /* 前馈按目标速度先给一个开环油门，PI 只修正残差：
+     否则积分要从 0 慢慢爬（实测 20 s 才到目标一半），且限幅会顶死。 */
+  speed_ff_pwm = Control_Clamp(tune_speed_ff * control_speed_target_mps,
+                               0.0f, CONTROL_MAX_PWM_CCR);
+
+  speed_error_left = control_speed_target_mps - speed_left_mps;
+  speed_left_state.integral = Control_Clamp(speed_left_state.integral + speed_error_left * dt,
+                                            -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
+  base_left_pwm = Control_Clamp(
+      speed_ff_pwm +
+      (tune_speed_kp * speed_error_left) + (tune_speed_ki * speed_left_state.integral),
       0.0f, CONTROL_MAX_PWM_CCR);
-  speed_state.previous_error = speed_error;
-  speed_state.initialized = 1U;
+  speed_left_state.previous_error = speed_error_left;
+  speed_left_state.initialized = 1U;
 
-  left_pwm = Control_Clamp(control_base_pwm - control_turn_pwm,
+  speed_error_right = control_speed_target_mps - speed_right_mps;
+  speed_right_state.integral = Control_Clamp(speed_right_state.integral + speed_error_right * dt,
+                                             -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
+  base_right_pwm = Control_Clamp(
+      speed_ff_pwm +
+      (tune_speed_kp * speed_error_right) + (tune_speed_ki * speed_right_state.integral),
+      0.0f, CONTROL_MAX_PWM_CCR);
+  speed_right_state.previous_error = speed_error_right;
+  speed_right_state.initialized = 1U;
+
+  /* 调试量：base 仍输出左右平均，便于和旧打印格式对照。 */
+  control_base_pwm = (base_left_pwm + base_right_pwm) * 0.5f;
+
+  left_pwm = Control_Clamp(base_left_pwm - control_turn_pwm,
                            0.0f, CONTROL_MAX_PWM_CCR);
-  right_pwm = Control_Clamp(control_base_pwm + control_turn_pwm,
+  right_pwm = Control_Clamp(base_right_pwm + control_turn_pwm,
                             0.0f, CONTROL_MAX_PWM_CCR);
   /* 死区补偿只作用于最终写进 CCR 的值，控制环内部仍用未补偿的 PWM。 */
-  control_left_pwm = Motor_ApplyDeadzone(left_pwm, MOTOR_DEADZONE_L);
-  control_right_pwm = Motor_ApplyDeadzone(right_pwm, MOTOR_DEADZONE_R);
+  control_left_pwm = Motor_ApplyDeadzone(left_pwm, tune_deadzone_l);
+  control_right_pwm = Motor_ApplyDeadzone(right_pwm, tune_deadzone_r);
 
   /* 电机输出需人工完成标定后才可启用；当前编译配置保持关闭。 */
   if (MOTOR_CONTROL_ENABLE != 0U)
@@ -615,8 +1033,10 @@ static void VehicleControl_Update(void)
   }
 
   /* 堵转保护：指令已超过起转占空比，两轮却都几乎不转，判定卡死并停机。
-     发车后留 MOTOR_RUN_GRACE_MS 的起步时间，避免把正常起步误判成卡死。 */
-  if ((MOTOR_CONTROL_ENABLE != 0U) && (run_ticks > MOTOR_GRACE_TICKS) &&
+     发车后留 MOTOR_RUN_GRACE_MS 的起步时间，避免把正常起步误判成卡死。
+     台架调参时可用 stl=0 关闭（车轮架空或被人按住时不会误停）。 */
+  if ((MOTOR_CONTROL_ENABLE != 0U) && (tune_stall_enable != 0U) &&
+      (run_ticks > MOTOR_GRACE_TICKS) &&
       ((control_left_pwm >= MOTOR_STALL_PWM_MIN) ||
        (control_right_pwm >= MOTOR_STALL_PWM_MIN)) &&
       (average_speed < MOTOR_STALL_SPEED_MPS) &&
@@ -626,9 +1046,15 @@ static void VehicleControl_Update(void)
       ++stall_ticks;
     if (stall_ticks >= MOTOR_STALL_TICKS)
     {
+      /* 记录故障瞬间的速度与占空比：速度全 0 才是编码器没读数，
+         有速度却停机说明是机械卡住或被人按住。 */
+      fault_speed_l_mmps = (int32_t)(speed_left_mps * 1000.0f);
+      fault_speed_r_mmps = (int32_t)(speed_right_mps * 1000.0f);
+      fault_ccr_l = control_left_pwm;
+      fault_ccr_r = control_right_pwm;
       control_fault = FAULT_STALL;
       run_button_started = 0U;
-      VehicleControl_Reset(&line_state, &yaw_state, &speed_state);
+      VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
     }
   }
   else
@@ -663,6 +1089,10 @@ static void RunButton_Update(void)
     /* 本项目按低电平按下处理。 */
     if (stable_state == RUN_BUTTON_PRESSED)
     {
+      /* 每次按键都清零累计计数，便于“清零 → 推行 1 m → 读 odom”标定。 */
+      odom_left = 0;
+      odom_right = 0;
+
       if (run_button_started == 0U)
       {
         /* 重新发车：清故障码，零偏用停稳期间累积的样本重新校准。 */
@@ -721,8 +1151,7 @@ static void Watchdog_Feed(void)
 #if WATCHDOG_ENABLE
   IWDG->KR = 0xAAAAU;
 #endif
-}
-/**
+}/**
  * @brief  The application entry point.
  * @retval int
  */
@@ -794,6 +1223,14 @@ int main(void)
   /* 看门狗最后启动：前面的初始化（含负压启动 2 s 等待）不受其超时约束。 */
   Watchdog_Init();
 
+#if TUNE_ENABLE
+  /* 启动 USART3 单字节接收中断：在线整定的数据入口（有线/无线共用）。 */
+  if (HAL_UART_Receive_IT(&huart3, &tune_rx_byte, 1U) != HAL_OK)
+    printf("tune,rx_fail\r\n");
+  else
+    printf("tune,ready,%s %s\r\n", __DATE__, __TIME__);
+#endif
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -802,6 +1239,9 @@ int main(void)
   {
     Watchdog_Feed();
     RunButton_Update();
+#if TUNE_ENABLE
+    Tune_Update();
+#endif
 
     /* 发车状态变化时报告一次：1 = 运行中，0 = 已停车。 */
     {
@@ -823,7 +1263,17 @@ int main(void)
       else if (fault_reported != control_fault)
       {
         fault_reported = control_fault;
-        printf("fault,%u\r\n", (unsigned int)control_fault);
+        /* 堵转故障附带现场数据：spdL/spdR 单位 mm/s，CCR 为实际写入值。 */
+        if (control_fault == FAULT_STALL)
+        {
+          printf("fault,%u,%ld,%ld,%u,%u\r\n", (unsigned int)control_fault,
+                 (long)fault_speed_l_mmps, (long)fault_speed_r_mmps,
+                 (unsigned int)fault_ccr_l, (unsigned int)fault_ccr_r);
+        }
+        else
+        {
+          printf("fault,%u\r\n", (unsigned int)control_fault);
+        }
       }
     }
 
@@ -847,7 +1297,8 @@ int main(void)
 #if LINE_SENSOR_DEBUG
     {
       static uint32_t line_print_tick;
-      if ((HAL_GetTick() - line_print_tick) >= LINE_PRINT_MS)
+      if ((debug_print_on != 0U) &&
+          ((HAL_GetTick() - line_print_tick) >= LINE_PRINT_MS))
       {
         line_print_tick = HAL_GetTick();
         printf("line,%u%u%u%u%u%u%u%u%u%u%u%u,%u,%d\r\n",
@@ -868,9 +1319,21 @@ int main(void)
     }
 #endif
 #if SPEED_DEBUG
+    /* 累计计数：标定“每米计数”用，按一次发车键清零。 */
+    {
+      static uint32_t odom_print_tick;
+      if ((debug_print_on != 0U) &&
+          ((HAL_GetTick() - odom_print_tick) >= ODOM_PRINT_MS))
+      {
+        odom_print_tick = HAL_GetTick();
+        printf("odom,%ld,%ld\r\n",
+               (long)odom_left, (long)odom_right);
+      }
+    }
     {
       static uint32_t speed_print_tick;
-      if ((HAL_GetTick() - speed_print_tick) >= SPEED_PRINT_MS)
+      if ((debug_print_on != 0U) &&
+          ((HAL_GetTick() - speed_print_tick) >= SPEED_PRINT_MS))
       {
         speed_print_tick = HAL_GetTick();
         printf("enc,%ld,%ld,%ld,%ld\r\n",
@@ -882,7 +1345,8 @@ int main(void)
 #if SPEED_DEBUG
     {
       static uint32_t control_print_tick;
-      if ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS)
+      if ((debug_print_on != 0U) &&
+          ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS))
       {
         control_print_tick = HAL_GetTick();
         printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u\r\n",
@@ -911,7 +1375,7 @@ int main(void)
     accel_x = BMI270_acc_transition(BMI270_accel_x); // 将原始加速度计数据转换为物理值，单位为g，一般不需要使用此数据
     accel_y = BMI270_acc_transition(BMI270_accel_y);
     accel_z = BMI270_acc_transition(BMI270_accel_z);
-    if (GYRO_DEBUG)
+    if ((GYRO_DEBUG) && (debug_print_on != 0U))
     {
       static uint32_t gyro_print_tick;
       if ((HAL_GetTick() - gyro_print_tick) >= GYRO_PRINT_MS)
@@ -1387,14 +1851,44 @@ static void Encoder_UpdateSpeed(void)
 
   enc_left_delta  = left;
   enc_right_delta = right;
+  odom_left  += left;
+  odom_right += right;
   speed_left_mps  = (float)enc_left_sum  * ENC_COUNTS_TO_MPS;
   speed_right_mps = (float)enc_right_sum * ENC_COUNTS_TO_MPS;
 }
 
+#if TUNE_ENABLE
+/* USART3 接收完成回调：只做入队和重新挂接收，解析交给主循环。 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    const uint16_t next = (uint16_t)((tune_rx_head + 1U) % TUNE_RX_BUFFER_SIZE);
+
+    if (next != tune_rx_tail)
+    {
+      tune_rx_buffer[tune_rx_head] = tune_rx_byte;
+      tune_rx_head = next;
+    }
+    HAL_UART_Receive_IT(&huart3, &tune_rx_byte, 1U);
+  }
+}
+
+/* 无线串口容易因干扰产生溢出错误，HAL 会停止接收；这里清标志并重新挂接收，
+   否则调参链路会静默失效。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    HAL_UART_Receive_IT(&huart3, &tune_rx_byte, 1U);
+  }
+}
+#endif
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   static uint16_t speed_divider;
-
   if (htim->Instance != TIM2)
     return;
 
