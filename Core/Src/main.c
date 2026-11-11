@@ -174,8 +174,14 @@ static volatile uint16_t fault_ccr_r;
    实测 550 时 10 dps 误差就会给出 0.73 m/s 差速（≈320 dps 转向），开环增益约 30 倍，
    必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
 #define YAW_DIFF_PWM_PER_MPS       5500.0f
-/* 单次差速偏置上限，防止角速度环饱和时把车打成原地转圈。 */
-#define YAW_DIFF_LIMIT_MPS         0.35f
+/* 角速度前馈：按目标角速度直接给差速（m/s 每 dps）。
+   没有它时差速只能靠 P 项，而 P 为了稳定必须很小，
+   导致最大差速被限制在 turn/5500 = 0.127 m/s（转向约 52 dps），
+   过 0.3 m 半径的弯需要约 95 dps，物理上转不过来，表现就是"直着冲出弯道"。
+   前馈按目标值给，不进入闭环，因此不影响稳定性，只提供转向权限。 */
+#define YAW_DIFF_FF_MPS_PER_DPS    0.007f
+/* 单次差速偏置上限，防止饱和打转。 */
+#define YAW_DIFF_LIMIT_MPS         0.40f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
 #define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
@@ -366,6 +372,8 @@ static volatile float tune_yaw_sign     = YAW_RATE_SIGN;
 static const float yaw_rate_filter_alpha = 0.5f;
 /* 零偏手动微调（dps）：自动校准后若仍有残余，用 ofs=±x 在线拧到静止读数为 0。 */
 static volatile float tune_gyro_trim = GYRO_TRIM_DPS;
+/* 角速度前馈系数（m/s 每 dps）：直接决定"能不能转过急弯"，可在线调。 */
+static volatile float tune_yaw_ff = YAW_DIFF_FF_MPS_PER_DPS;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -543,7 +551,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -569,6 +577,7 @@ static void Tune_ApplyParameter(uint8_t index, float value)
     case 12U: tune_stall_enable = (value != 0.0f) ? 1U : 0U; break;
     case 13U: tune_yaw_sign   = (value < 0.0f) ? -1.0f : 1.0f; break;
     case 14U: tune_gyro_trim  = value; break;
+    case 15U: tune_yaw_ff     = value; break;
     default:  return;
   }
   printf("set,%u,%ld\r\n", (unsigned int)index, (long)(value * 1000.0f));
@@ -633,7 +642,7 @@ static float Tune_ParseValue(const char *s, uint8_t len, uint8_t *ok)
    上电时若 magic / 版本 / 校验都匹配则自动加载，否则用宏默认值。 */
 #define TUNE_FLASH_ADDR     0x0800FC00U
 #define TUNE_MAGIC_VALUE    0x53434647U   /* 'SCFG' */
-#define TUNE_VERSION_VALUE  1U
+#define TUNE_VERSION_VALUE  2U
 
 typedef struct
 {
@@ -653,6 +662,7 @@ typedef struct
   float deadzone_r;
   float yaw_sign;
   float gyro_trim;
+  float yaw_ff;
   uint32_t stall_enable;
   uint32_t checksum;
 } TuneConfig;
@@ -688,6 +698,7 @@ static void Tune_SetDefaults(void)
   tune_deadzone_r   = MOTOR_DEADZONE_R;
   tune_yaw_sign     = YAW_RATE_SIGN;
   tune_gyro_trim    = GYRO_TRIM_DPS;
+  tune_yaw_ff       = YAW_DIFF_FF_MPS_PER_DPS;
   tune_stall_enable = 1U;
 }
 
@@ -716,6 +727,7 @@ static uint8_t Tune_LoadFromFlash(void)
   tune_deadzone_r   = cfg->deadzone_r;
   tune_yaw_sign     = (cfg->yaw_sign < 0.0f) ? -1.0f : 1.0f;
   tune_gyro_trim    = cfg->gyro_trim;
+  tune_yaw_ff       = cfg->yaw_ff;
   tune_stall_enable = (cfg->stall_enable != 0U) ? 1U : 0U;
   return 1U;
 }
@@ -747,6 +759,7 @@ static uint8_t Tune_SaveToFlash(void)
   cfg.deadzone_r    = tune_deadzone_r;
   cfg.yaw_sign      = tune_yaw_sign;
   cfg.gyro_trim     = tune_gyro_trim;
+  cfg.yaw_ff        = tune_yaw_ff;
   cfg.stall_enable  = (uint32_t)tune_stall_enable;
   cfg.checksum      = Tune_Checksum(&cfg);
 
@@ -801,7 +814,7 @@ static void Tune_PrintAll(void)
 {
   /* 单行紧凑输出：便于在滚动日志里一眼看全，也方便整行复制。
      数值统一 ×1000，例如 spd 显示 700 表示 0.700。 */
-  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u,ysg=%ld,ofs=%ld\r\n",
+  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u,ysg=%ld,ofs=%ld,yff=%ld\r\n",
          (long)(tune_line_kp * 1000.0f),
          (long)(tune_line_kd * 1000.0f),
          (long)(tune_yaw_kp * 1000.0f),
@@ -815,7 +828,8 @@ static void Tune_PrintAll(void)
          (long)(tune_deadzone_r * 1000.0f),
          (unsigned int)tune_stall_enable,
          (long)tune_yaw_sign,
-         (long)(tune_gyro_trim * 1000.0f));
+         (long)(tune_gyro_trim * 1000.0f),
+         (long)(tune_yaw_ff * 1000000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -907,7 +921,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 14U; ++k)
+  for (k = 0U; k < 15U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1195,7 +1209,6 @@ static void VehicleControl_Update(void)
      共用一个 base 时偏弱的一侧会一直慢，车就会持续往一侧偏。
      分开闭环后每个轮子都各自跟到目标速度，直道自然走正。 */
   average_speed = (speed_left_mps + speed_right_mps) * 0.5f;
-
   /* 方向保护：目标速度为正时两轮平均速度却持续为负，说明编码器方向接反。 */
   if ((run_ticks > MOTOR_GRACE_TICKS) && (tune_target_speed > 0.05f) &&
       (average_speed < MOTOR_REVERSE_SPEED_MPS))
@@ -1210,8 +1223,13 @@ static void VehicleControl_Update(void)
      若在 PWM 上加减，每轮速度 PI 会把被减掉的速度补回来，yaw 环给出的差速
      几百毫秒内就被抵消掉（表现为“加大 ykp 车照样走直线”）。
      转成目标偏置后，差速由两个速度环各自实现，二者不再互相打架。 */
-  yaw_differential_mps = Control_Clamp(control_turn_pwm / YAW_DIFF_PWM_PER_MPS,
-                                       -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
+  /* 差速 = 前馈（按目标角速度给权限）+ P 项（按误差修正），整体限幅。
+     前馈负责"转得动"（急弯需要 0.3 m/s 以上差速），
+     P 项负责"转得准"，两者分开后增益与权限不再互相牵制。 */
+  yaw_differential_mps = Control_Clamp(
+      (tune_yaw_ff * control_target_yaw_rate_dps) +
+      (control_turn_pwm / YAW_DIFF_PWM_PER_MPS),
+      -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
 
   {
     /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
