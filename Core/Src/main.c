@@ -38,7 +38,7 @@
 /* 陀螺仪调试打印开关。置 1 会引入约 5.4 kB 的浮点 printf 代码，
    MDK-Lite 的 32 kB 链接上限会因此报 L6047U 而链接失败。
    平时保持 0；要串口看数据时改成 1（并注意镜像大小）。 */
-#define GYRO_DEBUG 1
+#define GYRO_DEBUG 0
 #define IF_start_Brushless_motor 0 //是否启动无刷电机，1为启动，0为不启动（首次试车先置0）
 
 /* 整车试跑测试：上电后两轮按 MOTOR_TEST_CCR 转动 MOTOR_TEST_RUN_MS 后自动停车。
@@ -74,7 +74,7 @@
 #define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
 
 /* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
-#define LINE_SENSOR_ACTIVE_LEVEL 0U
+#define LINE_SENSOR_ACTIVE_LEVEL 1U
 #define LINE_SAMPLE_MS          10U
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
@@ -85,8 +85,9 @@
 /* 控制器只在完成实车标定后启用；0 表示不向电机 PWM 写入控制量。 */
 #define MOTOR_CONTROL_ENABLE       1U
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
-/* 速度环目标，起步标定值。若为 0，速度误差恒为负，基础 PWM 会被钳在 0 而无法起步。 */
-#define CONTROL_TARGET_SPEED_MPS   0.0f
+/* 速度环目标，比赛起始值。0.5 m/s 是"能稳定跑完整圈"的保守速度，
+   熟练后再用 spd=0.6 / 0.7 在线提速。若为 0，车不会动。 */
+#define CONTROL_TARGET_SPEED_MPS   0.50f
 #define CONTROL_MAX_PWM_CCR        700.0f
 #define CONTROL_MAX_YAW_RATE_DPS   180.0f
 
@@ -155,8 +156,8 @@ static volatile uint16_t fault_ccr_r;
    角速度 Kp 注意尺度：turn→差速换算为 YAW_DIFF_PWM_PER_MPS=5500，
    kp=10 时 10 dps 误差只产生 0.018 m/s 差速（闭环增益约 0.8，稳定区）。
    历史上按旧尺度(550)调出的 80 在本尺度下相当于 800，会让车身持续振荡。 */
-#define LINE_PD_KP                 5.0f  /* 目标角速度 / 循迹误差 */
-#define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率 */
+#define LINE_PD_KP                 8.0f  /* 目标角速度 / 循迹误差（最大误差 6 → 48 dps） */
+#define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率（需要抑制过冲再加 0.05） */
 #define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
