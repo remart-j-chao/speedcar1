@@ -94,7 +94,7 @@
 /* 陀螺仪安装方向修正：让“右转（俯视顺时针）”对应正角速度。
    实测方法：手拿车顺时针慢转，串口 gyro 打印的 z 应为正；若为负改成 -1.0f。
    符号错会让角速度环变成正反馈，表现为原地打转。 */
-#define YAW_RATE_SIGN              1.0f
+#define YAW_RATE_SIGN             1.0f
 /* 扣除零偏后的静止死区，单位 dps；残余漂移小于该值时按 0 处理。
    1.0 dps 可以挡掉台架/地面静止时的大部分噪声，又不会明显损失转向灵敏度。 */
 #define GYRO_DEADBAND_DPS          1.0f
@@ -156,11 +156,20 @@ static volatile uint16_t fault_ccr_r;
    角速度 Kp 注意尺度：turn→差速换算为 YAW_DIFF_PWM_PER_MPS=5500，
    kp=10 时 10 dps 误差只产生 0.018 m/s 差速（闭环增益约 0.8，稳定区）。
    历史上按旧尺度(550)调出的 80 在本尺度下相当于 800，会让车身持续振荡。 */
-#define LINE_PD_KP                 20.0f /* 目标角速度 / 循迹误差（最大误差 6 → 120 dps）。
-                                            0.3 m 半径弯 @0.5 m/s 需要约 95 dps，
-                                            所以 Kp 不能低于 16，否则物理上过不去。 */
-#define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率（需要抑制过冲再加 0.05） */
-#define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差 */
+#define LINE_PD_KP                 35.0f /* 目标角速度 / 循迹误差（最大误差 6 → 210 dps，限幅 180）。
+                                            纯 P 循迹的稳态偏差 = 所需角速度 / Kp：
+                                            0.3 m 弯 @0.5 m/s 需 95 dps，Kp=35 时偏差约 2.7 路，
+                                            Kp=20 要 4.8 路（已接近出界），所以不能更小。 */
+#define LINE_PD_KD                 0.1f  /* 目标角速度 / 循迹误差变化率（抑制过冲）。
+                                           13 路插值、10 ms 周期下 Δerr=1 约给 10 dps。 */
+/* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
+   必须与角速度环的方向一致：
+   差速为正 → 左轮慢右轮快 → 车向左（逆时针）转；
+   角速度环能稳定跟踪正目标就意味着"正目标 = 左转"，
+   而线偏右（err>0）时必须右转，所以这里取 -1。
+   符号错的表现：直道几秒就甩出线，弯道直接冲出赛道（越偏越往外打）。 */
+#define LINE_ERROR_SIGN            (-1.0f)
+#define YAW_PID_KP                 12.0f /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
 #define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
@@ -177,10 +186,9 @@ static volatile uint16_t fault_ccr_r;
    必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
 #define YAW_DIFF_PWM_PER_MPS       5500.0f
 /* 角速度前馈：按目标角速度直接给差速（m/s 每 dps）。
-   它让角速度环在起步就接近目标，避免只靠 P 项而被 turn 饱和卡在 0.127 m/s。
-   取值需与 P 增益同量级（P 项等效 10/5500≈0.0018），取 0.002 时
-   稳态约能跟上目标，再大就会转过头导致画龙。 */
-#define YAW_DIFF_FF_MPS_PER_DPS    0.002f
+   理论上"完全跟上目标"所需的系数是 轮距/57.3 = 0.14/57.3 ≈ 0.00244，
+   取 0.0024 时前馈本身就能覆盖绝大部分转向需求，P 项只补残差。 */
+#define YAW_DIFF_FF_MPS_PER_DPS    0.0024f
 /* 单次差速偏置上限，防止饱和打转。 */
 #define YAW_DIFF_LIMIT_MPS         0.40f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
@@ -334,7 +342,7 @@ static uint16_t line_polarity_votes;
 static uint16_t line_polarity_ok_votes;
 static uint16_t line_polarity_total;
 /* 循迹方向修正：lsg=-1 可在线翻转，用于排查"越偏越往外打"的情况。 */
-static volatile float tune_line_sign = 1.0f;
+static volatile float tune_line_sign = LINE_ERROR_SIGN;
 
 /* 发车键每按一次在"待发车"和"运行中"之间切换：1 表示运行中。 */
 static volatile uint8_t run_button_started;
@@ -790,7 +798,7 @@ static void Tune_SetDefaults(void)
   tune_yaw_sign     = YAW_RATE_SIGN;
   tune_gyro_trim    = GYRO_TRIM_DPS;
   tune_yaw_ff       = YAW_DIFF_FF_MPS_PER_DPS;
-  tune_line_sign    = 1.0f;
+  tune_line_sign    = LINE_ERROR_SIGN;
   tune_stall_enable = 1U;
 }
 
