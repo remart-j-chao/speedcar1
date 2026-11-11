@@ -624,8 +624,8 @@ static float Tune_ParseValue(const char *s, uint8_t len, uint8_t *ok)
 }
 
 /* ---------------- 参数持久化：Flash 最后一页 ----------------
-   STM32F103C8 为 64 KB Flash、1 KB/页，程序区当前约 35 KB，
-   使用最后一页 0x0800FC00 存放整定参数，不触碰程序区。
+   STM32F103C8 为 64 KB Flash、1 KB/页，程序区当前约 44.9 kB，
+   最后一页 0x0800FC00 起还剩约 18 kB 余量，用它存放整定参数，不触碰程序区。
    上电时若 magic / 版本 / 校验都匹配则自动加载，否则用宏默认值。 */
 #define TUNE_FLASH_ADDR     0x0800FC00U
 #define TUNE_MAGIC_VALUE    0x53434647U   /* 'SCFG' */
