@@ -156,7 +156,9 @@ static volatile uint16_t fault_ccr_r;
    角速度 Kp 注意尺度：turn→差速换算为 YAW_DIFF_PWM_PER_MPS=5500，
    kp=10 时 10 dps 误差只产生 0.018 m/s 差速（闭环增益约 0.8，稳定区）。
    历史上按旧尺度(550)调出的 80 在本尺度下相当于 800，会让车身持续振荡。 */
-#define LINE_PD_KP                 8.0f  /* 目标角速度 / 循迹误差（最大误差 6 → 48 dps） */
+#define LINE_PD_KP                 20.0f /* 目标角速度 / 循迹误差（最大误差 6 → 120 dps）。
+                                            0.3 m 半径弯 @0.5 m/s 需要约 95 dps，
+                                            所以 Kp 不能低于 16，否则物理上过不去。 */
 #define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率（需要抑制过冲再加 0.05） */
 #define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
@@ -175,11 +177,10 @@ static volatile uint16_t fault_ccr_r;
    必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
 #define YAW_DIFF_PWM_PER_MPS       5500.0f
 /* 角速度前馈：按目标角速度直接给差速（m/s 每 dps）。
-   没有它时差速只能靠 P 项，而 P 为了稳定必须很小，
-   导致最大差速被限制在 turn/5500 = 0.127 m/s（转向约 52 dps），
-   过 0.3 m 半径的弯需要约 95 dps，物理上转不过来，表现就是"直着冲出弯道"。
-   前馈按目标值给，不进入闭环，因此不影响稳定性，只提供转向权限。 */
-#define YAW_DIFF_FF_MPS_PER_DPS    0.007f
+   它让角速度环在起步就接近目标，避免只靠 P 项而被 turn 饱和卡在 0.127 m/s。
+   取值需与 P 增益同量级（P 项等效 10/5500≈0.0018），取 0.002 时
+   稳态约能跟上目标，再大就会转过头导致画龙。 */
+#define YAW_DIFF_FF_MPS_PER_DPS    0.002f
 /* 单次差速偏置上限，防止饱和打转。 */
 #define YAW_DIFF_LIMIT_MPS         0.40f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
