@@ -86,16 +86,22 @@
 #define MOTOR_CONTROL_ENABLE       1U
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
 /* 速度环目标，起步标定值。若为 0，速度误差恒为负，基础 PWM 会被钳在 0 而无法起步。 */
-#define CONTROL_TARGET_SPEED_MPS   0.7f
+#define CONTROL_TARGET_SPEED_MPS   0.0f
 #define CONTROL_MAX_PWM_CCR        700.0f
 #define CONTROL_MAX_YAW_RATE_DPS   180.0f
 
-/* 陀螺仪安装方向修正：让"右转（俯视顺时针）"对应正角速度，与
-   left = base - turn / right = base + turn 的差速定义保持一致。
-   实测方法：手拿车顺时针慢转，串口 gyro 打印的 z 应为正；若为负改成 -1.0f。 */
+/* 陀螺仪安装方向修正：让“右转（俯视顺时针）”对应正角速度。
+   实测方法：手拿车顺时针慢转，串口 gyro 打印的 z 应为正；若为负改成 -1.0f。
+   符号错会让角速度环变成正反馈，表现为原地打转。 */
 #define YAW_RATE_SIGN              1.0f
-/* 扣除零偏后的静止死区，单位 dps；残余漂移小于该值时按 0 处理。 */
-#define GYRO_DEADBAND_DPS          0.3f
+/* 扣除零偏后的静止死区，单位 dps；残余漂移小于该值时按 0 处理。
+   1.0 dps 可以挡掉台架/地面静止时的大部分噪声，又不会明显损失转向灵敏度。 */
+#define GYRO_DEADBAND_DPS          1.0f
+/* 零偏微调的默认值（dps）：自动校准后若仍有残余，把它写在这里固化。
+   运行中也可用 ofs=±x 在线调整；save 命令会把它写入 Flash。 */
+#define GYRO_TRIM_DPS              0.0f
+/* 上电时是否从 Flash 加载已保存的参数（1=加载，0=只用宏默认值）。 */
+#define TUNE_LOAD_ON_BOOT          1
 /* 上电后先静置一段时间等滤波器稳定，再用静止期样本求零偏均值。
    累积样本数设上限，避免长时间等待后浮点累加和过大而损失精度。 */
 #define GYRO_BIAS_SETTLE_MS        500U
@@ -148,15 +154,26 @@ static volatile uint16_t fault_ccr_r;
 /* 以下增益均为待标定值，默认置零，避免未经调参产生电机输出。 */
 #define LINE_PD_KP                 0.0f  /* 目标角速度 / 循迹误差 */
 #define LINE_PD_KD                 0.0f  /* 目标角速度 / 循迹误差变化率 */
-#define YAW_PID_KP                 0.0f  /* 差速 PWM / 角速度误差 */
+#define YAW_PID_KP                 80.0f  /* 差速 PWM / 角速度误差 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
 #define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
-#define SPEED_PI_KI                120.0f  /* 基础 PWM / 速度误差积分（为 0 时靠 P 撑不住稳态，必抖） */
+#define SPEED_PI_KI                60.0f   /* 基础 PWM / 速度误差积分。
+                                              为 0 时靠 P 撑不住稳态必抖；过大则撞墙时积分瞬间触限，
+                                              脱困瞬间猛窜（实测 0.8 s 从 120 涨到 520，故取 60）。 */
 /* 速度前馈：base 先按目标速度给一个开环油门，PI 只负责修正残差。
-   没有前馈时积分要从 0 慢慢爬上去（实测 20 s 才到目标的一半），
-   而且积分限幅太小会永远到不了目标速度。 */
-#define SPEED_FF_PWM_PER_MPS       550.0f  /* 基础 PWM / (m/s)，按实测标定 */
+   实测标定：0.6 m/s 时实际只需要 base ≈ 77，故 77/0.6 ≈ 130。
+   填过大会让 PI 用负积分去压，积分一旦触限就失去调节能力。 */
+#define SPEED_FF_PWM_PER_MPS       130.0f  /* 基础 PWM / (m/s)，按实测标定 */
+/* 差速换算（固定值，与 SPEED_FF 解耦）：turn 的 PWM 量折算成左右轮速度偏置。
+   5500 意味着满 turn(700) 只对应 0.127 m/s 差速：
+   实测 550 时 10 dps 误差就会给出 0.73 m/s 差速（≈320 dps 转向），开环增益约 30 倍，
+   必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
+#define YAW_DIFF_PWM_PER_MPS       5500.0f
+/* 单次差速偏置上限，防止角速度环饱和时把车打成原地转圈。 */
+#define YAW_DIFF_LIMIT_MPS         0.35f
+/* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
+#define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
 #define SPEED_INTEGRAL_LIMIT       5.0f
 
@@ -337,6 +354,14 @@ static volatile float tune_yaw_kd       = YAW_PID_KD;
 static volatile float tune_speed_kp     = SPEED_PI_KP;
 static volatile float tune_speed_ki     = SPEED_PI_KI;
 static volatile float tune_speed_ff     = SPEED_FF_PWM_PER_MPS;
+/* 角速度方向修正，可在运行中翻转：ysg=-1 / ysg=1。
+   符号错会让角速度环变成正反馈（原地打转），必须先确认方向再调增益。 */
+static volatile float tune_yaw_sign     = YAW_RATE_SIGN;
+/* 角速度一阶低通系数（0~1，越大越平滑、相位滞后越大）。
+   电机振动会让 gyro_z 出现 ±2 dps 的高频噪声，滤波后角速度环可以用更大增益。 */
+static const float yaw_rate_filter_alpha = 0.5f;
+/* 零偏手动微调（dps）：自动校准后若仍有残余，用 ofs=±x 在线拧到静止读数为 0。 */
+static volatile float tune_gyro_trim = GYRO_TRIM_DPS;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -498,16 +523,23 @@ static void GyroBias_Restart(void)
 
    B. 纯文本命令（逐飞助手「串口助手」或任意串口工具，末尾回车换行）
         lkp=10    循迹 Kp        lkd=0    循迹 Kd
-        ykp=100   角速度 Kp      yki=0    角速度 Ki      ykd=0  角速度 Kd
-        skp=800   速度 Kp        ski=200  速度 Ki
-        spd=0.4   目标速度 m/s
-        dzl=450   dzr=470       左右轮死区 CCR
-        show      打印当前全部参数
-   参数不写 Flash，断电恢复宏值；调满意后把数值写回对应宏再编译。 */
+        ykp=5     角速度 Kp      yki=0    角速度 Ki      ykd=0  角速度 Kd
+        skp=500   速度 Kp        ski=60   速度 Ki        sff=130  速度前馈
+        spd=0.6   目标速度 m/s
+        dzl=310   dzr=300       左右轮死区 CCR
+        ysg=-1    角速度方向      ofs=0.6   零偏微调（dps）
+        stl=0     关闭堵转保护
+        show      打印当前全部参数      ?  同上
+        q / v     关闭 / 打开周期打印
+        save      把当前参数写入 Flash（断电不丢）
+        load      重新从 Flash 读取
+        default   恢复宏默认值并清除存档
+
+   参数默认来自下面的宏；用 save 保存后，每次上电会自动加载存档。 */
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -531,6 +563,8 @@ static void Tune_ApplyParameter(uint8_t index, float value)
     case 10U: tune_deadzone_r   = value; break;
     case 11U: tune_speed_ff     = value; break;
     case 12U: tune_stall_enable = (value != 0.0f) ? 1U : 0U; break;
+    case 13U: tune_yaw_sign   = (value < 0.0f) ? -1.0f : 1.0f; break;
+    case 14U: tune_gyro_trim  = value; break;
     default:  return;
   }
   printf("set,%u,%ld\r\n", (unsigned int)index, (long)(value * 1000.0f));
@@ -589,11 +623,181 @@ static float Tune_ParseValue(const char *s, uint8_t len, uint8_t *ok)
   return (negative != 0U) ? -value : value;
 }
 
+/* ---------------- 参数持久化：Flash 最后一页 ----------------
+   STM32F103C8 为 64 KB Flash、1 KB/页，程序区当前约 35 KB，
+   使用最后一页 0x0800FC00 存放整定参数，不触碰程序区。
+   上电时若 magic / 版本 / 校验都匹配则自动加载，否则用宏默认值。 */
+#define TUNE_FLASH_ADDR     0x0800FC00U
+#define TUNE_MAGIC_VALUE    0x53434647U   /* 'SCFG' */
+#define TUNE_VERSION_VALUE  1U
+
+typedef struct
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  float line_kp;
+  float line_kd;
+  float yaw_kp;
+  float yaw_ki;
+  float yaw_kd;
+  float speed_kp;
+  float speed_ki;
+  float speed_ff;
+  float target_speed;
+  float deadzone_l;
+  float deadzone_r;
+  float yaw_sign;
+  float gyro_trim;
+  uint32_t stall_enable;
+  uint32_t checksum;
+} TuneConfig;
+
+/* 按字写入 Flash 要求结构体大小是 4 的倍数，这里做编译期检查。 */
+typedef char TuneConfigSizeIsWordAligned[(sizeof(TuneConfig) % 4U == 0U) ? 1 : -1];
+
+/* 校验和只覆盖 checksum 之前的字段；乘法混合比简单求和更能发现位翻转。 */
+static uint32_t Tune_Checksum(const TuneConfig *cfg)
+{
+  const uint32_t *word = (const uint32_t *)cfg;
+  const uint32_t words = (uint32_t)((sizeof(TuneConfig) / 4U) - 1U);
+  uint32_t sum = 0x5A5A5A5AU;
+  uint32_t i;
+
+  for (i = 0U; i < words; ++i)
+    sum = (sum * 31U) + word[i];
+  return sum;
+}
+
+static void Tune_SetDefaults(void)
+{
+  tune_line_kp      = LINE_PD_KP;
+  tune_line_kd      = LINE_PD_KD;
+  tune_yaw_kp       = YAW_PID_KP;
+  tune_yaw_ki       = YAW_PID_KI;
+  tune_yaw_kd       = YAW_PID_KD;
+  tune_speed_kp     = SPEED_PI_KP;
+  tune_speed_ki     = SPEED_PI_KI;
+  tune_speed_ff     = SPEED_FF_PWM_PER_MPS;
+  tune_target_speed = CONTROL_TARGET_SPEED_MPS;
+  tune_deadzone_l   = MOTOR_DEADZONE_L;
+  tune_deadzone_r   = MOTOR_DEADZONE_R;
+  tune_yaw_sign     = YAW_RATE_SIGN;
+  tune_gyro_trim    = GYRO_TRIM_DPS;
+  tune_stall_enable = 1U;
+}
+
+/* 返回 1 表示加载成功。 */
+static uint8_t Tune_LoadFromFlash(void)
+{
+  const TuneConfig *cfg = (const TuneConfig *)TUNE_FLASH_ADDR;
+
+  if ((cfg->magic != TUNE_MAGIC_VALUE) ||
+      (cfg->version != TUNE_VERSION_VALUE) ||
+      (cfg->checksum != Tune_Checksum(cfg)))
+  {
+    return 0U;
+  }
+
+  tune_line_kp      = cfg->line_kp;
+  tune_line_kd      = cfg->line_kd;
+  tune_yaw_kp       = cfg->yaw_kp;
+  tune_yaw_ki       = cfg->yaw_ki;
+  tune_yaw_kd       = cfg->yaw_kd;
+  tune_speed_kp     = cfg->speed_kp;
+  tune_speed_ki     = cfg->speed_ki;
+  tune_speed_ff     = cfg->speed_ff;
+  tune_target_speed = cfg->target_speed;
+  tune_deadzone_l   = cfg->deadzone_l;
+  tune_deadzone_r   = cfg->deadzone_r;
+  tune_yaw_sign     = (cfg->yaw_sign < 0.0f) ? -1.0f : 1.0f;
+  tune_gyro_trim    = cfg->gyro_trim;
+  tune_stall_enable = (cfg->stall_enable != 0U) ? 1U : 0U;
+  return 1U;
+}
+
+/* 先擦后写并回读校验。擦除期间 CPU 取指会停顿约几十毫秒，
+   所以请在停车状态下保存。返回 1 表示成功。 */
+static uint8_t Tune_SaveToFlash(void)
+{
+  TuneConfig cfg;
+  FLASH_EraseInitTypeDef erase;
+  uint32_t page_error = 0U;
+  uint32_t addr = TUNE_FLASH_ADDR;
+  const uint32_t *word;
+  uint32_t i;
+
+  cfg.magic         = TUNE_MAGIC_VALUE;
+  cfg.version       = TUNE_VERSION_VALUE;
+  cfg.reserved      = 0U;
+  cfg.line_kp       = tune_line_kp;
+  cfg.line_kd       = tune_line_kd;
+  cfg.yaw_kp        = tune_yaw_kp;
+  cfg.yaw_ki        = tune_yaw_ki;
+  cfg.yaw_kd        = tune_yaw_kd;
+  cfg.speed_kp      = tune_speed_kp;
+  cfg.speed_ki      = tune_speed_ki;
+  cfg.speed_ff      = tune_speed_ff;
+  cfg.target_speed  = tune_target_speed;
+  cfg.deadzone_l    = tune_deadzone_l;
+  cfg.deadzone_r    = tune_deadzone_r;
+  cfg.yaw_sign      = tune_yaw_sign;
+  cfg.gyro_trim     = tune_gyro_trim;
+  cfg.stall_enable  = (uint32_t)tune_stall_enable;
+  cfg.checksum      = Tune_Checksum(&cfg);
+
+  HAL_FLASH_Unlock();
+
+  erase.TypeErase   = FLASH_TYPEERASE_PAGES;
+  erase.Banks       = FLASH_BANK_1;
+  erase.PageAddress = TUNE_FLASH_ADDR;
+  erase.NbPages     = 1U;
+  if (HAL_FLASHEx_Erase(&erase, &page_error) != HAL_OK)
+  {
+    HAL_FLASH_Lock();
+    return 0U;
+  }
+
+  word = (const uint32_t *)&cfg;
+  for (i = 0U; i < (sizeof(TuneConfig) / 4U); ++i)
+  {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, word[i]) != HAL_OK)
+    {
+      HAL_FLASH_Lock();
+      return 0U;
+    }
+    addr += 4U;
+  }
+
+  HAL_FLASH_Lock();
+
+  /* 回读验证：magic、校验和都必须匹配 */
+  return (Tune_LoadFromFlash() != 0U) ? 1U : 0U;
+}
+
+/* 恢复宏默认值，并擦除 Flash 中的存档，避免下次上电又加载旧值。 */
+static uint8_t Tune_ResetDefaults(void)
+{
+  FLASH_EraseInitTypeDef erase;
+  uint32_t page_error = 0U;
+
+  Tune_SetDefaults();
+
+  HAL_FLASH_Unlock();
+  erase.TypeErase   = FLASH_TYPEERASE_PAGES;
+  erase.Banks       = FLASH_BANK_1;
+  erase.PageAddress = TUNE_FLASH_ADDR;
+  erase.NbPages     = 1U;
+  (void)HAL_FLASHEx_Erase(&erase, &page_error);
+  HAL_FLASH_Lock();
+  return 1U;
+}
+
 static void Tune_PrintAll(void)
 {
   /* 单行紧凑输出：便于在滚动日志里一眼看全，也方便整行复制。
      数值统一 ×1000，例如 spd 显示 700 表示 0.700。 */
-  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u\r\n",
+  printf("cfg,lkp=%ld,lkd=%ld,ykp=%ld,yki=%ld,ykd=%ld,skp=%ld,ski=%ld,sff=%ld,spd=%ld,dzl=%ld,dzr=%ld,stl=%u,ysg=%ld,ofs=%ld\r\n",
          (long)(tune_line_kp * 1000.0f),
          (long)(tune_line_kd * 1000.0f),
          (long)(tune_yaw_kp * 1000.0f),
@@ -605,7 +809,9 @@ static void Tune_PrintAll(void)
          (long)(tune_target_speed * 1000.0f),
          (long)(tune_deadzone_l * 1000.0f),
          (long)(tune_deadzone_r * 1000.0f),
-         (unsigned int)tune_stall_enable);
+         (unsigned int)tune_stall_enable,
+         (long)tune_yaw_sign,
+         (long)(tune_gyro_trim * 1000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -664,6 +870,24 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
+  /* 参数持久化：save 写 Flash，load 重新读取，default 恢复宏默认并清除存档。 */
+  if (Tune_NameMatch(line, len, "save") != 0U)
+  {
+    printf("flash,save,%u\r\n", (unsigned int)Tune_SaveToFlash());
+    return;
+  }
+  if (Tune_NameMatch(line, len, "load") != 0U)
+  {
+    printf("flash,load,%u\r\n", (unsigned int)Tune_LoadFromFlash());
+    return;
+  }
+  if ((Tune_NameMatch(line, len, "default") != 0U) ||
+      (Tune_NameMatch(line, len, "reset") != 0U))
+  {
+    printf("flash,default,%u\r\n", (unsigned int)Tune_ResetDefaults());
+    return;
+  }
+
   /* 名字部分到 '=' 或空格为止，例如 lkp=10 / lkp 10 */
   while ((name_len < len) && (line[name_len] != '=') && (line[name_len] != ' '))
     ++name_len;
@@ -679,7 +903,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 12U; ++k)
+  for (k = 0U; k < 14U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -860,6 +1084,7 @@ static void VehicleControl_Update(void)
   static uint16_t line_lost_ticks;
   static uint16_t run_ticks;
   static uint16_t stall_ticks;
+  static float yaw_rate_filtered;
   const float dt = (float)CONTROL_UPDATE_MS / 1000.0f;
   float line_error;
   float line_derivative;
@@ -868,7 +1093,11 @@ static void VehicleControl_Update(void)
   float yaw_derivative;
   float speed_error_left;
   float speed_error_right;
-  float speed_ff_pwm;
+  float speed_target_left;
+  float speed_target_right;
+  float speed_ff_left_pwm;
+  float speed_ff_right_pwm;
+  float yaw_differential_mps;
   float base_left_pwm;
   float base_right_pwm;
   float average_speed;
@@ -936,8 +1165,13 @@ static void VehicleControl_Update(void)
   line_state.previous_error = line_error;
   line_state.initialized = 1U;
 
-  /* 目标角速度与扣除零偏后的 BMI270 Z 轴角速度之差由 PID 转为左右轮差速量。 */
-  yaw_rate = gyro_z;
+  /* 目标角速度与扣除零偏后的 BMI270 Z 轴角速度之差由 PID 转为差速偏置。
+     安装方向修正只作用在这里：调试打印的 gyro_z 始终是传感器原始方向。 */
+  yaw_rate = tune_yaw_sign * gyro_z;
+  /* 一阶低通抑制电机振动带来的高频噪声（只在控制环内使用）。 */
+  yaw_rate_filtered = (yaw_rate_filter_alpha * yaw_rate_filtered) +
+                      ((1.0f - yaw_rate_filter_alpha) * yaw_rate);
+  yaw_rate = yaw_rate_filtered;
   if ((yaw_rate < GYRO_DEADBAND_DPS) && (yaw_rate > -GYRO_DEADBAND_DPS))
     yaw_rate = 0.0f;
   yaw_error = control_target_yaw_rate_dps - yaw_rate;
@@ -968,9 +1202,16 @@ static void VehicleControl_Update(void)
     return;
   }
 
-  /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
-     目标值可在运行中改（在线整定），这里取一次快照保证本轮一致。 */
+  /* 差速以“左右轮目标速度偏置”的形式进入速度环，而不是在 PWM 上加减。
+     若在 PWM 上加减，每轮速度 PI 会把被减掉的速度补回来，yaw 环给出的差速
+     几百毫秒内就被抵消掉（表现为“加大 ykp 车照样走直线”）。
+     转成目标偏置后，差速由两个速度环各自实现，二者不再互相打架。 */
+  yaw_differential_mps = Control_Clamp(control_turn_pwm / YAW_DIFF_PWM_PER_MPS,
+                                       -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
+
   {
+    /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
+       目标值可在运行中改（在线整定），这里取一次快照保证本轮一致。 */
     const float speed_target = tune_target_speed;
 
     if (control_speed_target_mps < speed_target)
@@ -987,26 +1228,43 @@ static void VehicleControl_Update(void)
     }
   }
 
-  /* 前馈按目标速度先给一个开环油门，PI 只修正残差：
-     否则积分要从 0 慢慢爬（实测 20 s 才到目标一半），且限幅会顶死。 */
-  speed_ff_pwm = Control_Clamp(tune_speed_ff * control_speed_target_mps,
-                               0.0f, CONTROL_MAX_PWM_CCR);
+  /* 左右轮各自的目标速度：基速 ± 差速偏置。偏置为负时该侧目标降到 0（原地转向）。 */
+  speed_target_left = Control_Clamp(control_speed_target_mps - yaw_differential_mps,
+                                    0.0f, CONTROL_SPEED_TARGET_LIMIT_MPS);
+  speed_target_right = Control_Clamp(control_speed_target_mps + yaw_differential_mps,
+                                     0.0f, CONTROL_SPEED_TARGET_LIMIT_MPS);
 
-  speed_error_left = control_speed_target_mps - speed_left_mps;
+  /* 零速（停车或尚未起步）时不允许任何差速：
+     陀螺仪残余零偏会被角速度环放大成一个持续的差速，
+     表现为“目标速度 0 但车自己在地上爬/打转”。 */
+  if (control_speed_target_mps <= 0.0f)
+  {
+    speed_target_left = 0.0f;
+    speed_target_right = 0.0f;
+    yaw_differential_mps = 0.0f;
+  }
+
+  /* 前馈按各自的目标速度给开环油门，PI 只修正残差。 */
+  speed_ff_left_pwm = Control_Clamp(tune_speed_ff * speed_target_left,
+                                    0.0f, CONTROL_MAX_PWM_CCR);
+  speed_ff_right_pwm = Control_Clamp(tune_speed_ff * speed_target_right,
+                                     0.0f, CONTROL_MAX_PWM_CCR);
+
+  speed_error_left = speed_target_left - speed_left_mps;
   speed_left_state.integral = Control_Clamp(speed_left_state.integral + speed_error_left * dt,
                                             -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
   base_left_pwm = Control_Clamp(
-      speed_ff_pwm +
+      speed_ff_left_pwm +
       (tune_speed_kp * speed_error_left) + (tune_speed_ki * speed_left_state.integral),
       0.0f, CONTROL_MAX_PWM_CCR);
   speed_left_state.previous_error = speed_error_left;
   speed_left_state.initialized = 1U;
 
-  speed_error_right = control_speed_target_mps - speed_right_mps;
+  speed_error_right = speed_target_right - speed_right_mps;
   speed_right_state.integral = Control_Clamp(speed_right_state.integral + speed_error_right * dt,
                                              -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
   base_right_pwm = Control_Clamp(
-      speed_ff_pwm +
+      speed_ff_right_pwm +
       (tune_speed_kp * speed_error_right) + (tune_speed_ki * speed_right_state.integral),
       0.0f, CONTROL_MAX_PWM_CCR);
   speed_right_state.previous_error = speed_error_right;
@@ -1015,10 +1273,8 @@ static void VehicleControl_Update(void)
   /* 调试量：base 仍输出左右平均，便于和旧打印格式对照。 */
   control_base_pwm = (base_left_pwm + base_right_pwm) * 0.5f;
 
-  left_pwm = Control_Clamp(base_left_pwm - control_turn_pwm,
-                           0.0f, CONTROL_MAX_PWM_CCR);
-  right_pwm = Control_Clamp(base_right_pwm + control_turn_pwm,
-                            0.0f, CONTROL_MAX_PWM_CCR);
+  left_pwm = base_left_pwm;
+  right_pwm = base_right_pwm;
   /* 死区补偿只作用于最终写进 CCR 的值，控制环内部仍用未补偿的 PWM。 */
   control_left_pwm = Motor_ApplyDeadzone(left_pwm, tune_deadzone_l);
   control_right_pwm = Motor_ApplyDeadzone(right_pwm, tune_deadzone_r);
@@ -1229,6 +1485,11 @@ int main(void)
     printf("tune,rx_fail\r\n");
   else
     printf("tune,ready,%s %s\r\n", __DATE__, __TIME__);
+
+#if TUNE_LOAD_ON_BOOT
+  /* 上电优先使用 Flash 中已保存的整定参数；无有效存档时保持宏默认值。 */
+  printf("flash,load,%u\r\n", (unsigned int)Tune_LoadFromFlash());
+#endif
 #endif
 
   /* USER CODE END 2 */
@@ -1368,7 +1629,9 @@ int main(void)
       /* 原始 Z 轴角速度先参与零偏采样；扣除零偏并按安装方向修正后才送控制环。 */
       float raw_gyro_z = BMI270_gyro_transition(BMI270_gyro_z);
       GyroBias_Update(raw_gyro_z);
-      gyro_z = YAW_RATE_SIGN * (raw_gyro_z - gyro_z_offset);
+      /* gyro_z 保持原始方向（未乘 YAW_RATE_SIGN），这样人工转车检查符号时看到的
+         就是传感器真实方向；方向修正只在控制环内部应用。 */
+      gyro_z = raw_gyro_z - gyro_z_offset + tune_gyro_trim;
     }
     gyro_x = BMI270_gyro_transition(BMI270_gyro_x); // 将原始陀螺仪数据转换为物理值，单位为度每秒
     gyro_y = BMI270_gyro_transition(BMI270_gyro_y);
