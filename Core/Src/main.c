@@ -170,13 +170,13 @@ static volatile uint16_t fault_ccr_r;
    而线偏右（err>0）时必须右转，所以这里取 -1。
    符号错的表现：直道几秒就甩出线，弯道直接冲出赛道（越偏越往外打）。 */
 #define LINE_ERROR_SIGN            (-1.0f)
-#define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差。
-                                            P 只补前馈的残差：10/5500≈0.0018 m/s per dps。
-                                            实测对象增益 K≈356 dps per m/s，闭环增益
-                                            b=356×10/5500≈0.65（<1，稳定）；
-                                            前馈 a=356×0.0028≈1.0，稳态跟随≈100%。
-                                            注意：这个值设成 0 会让角速度环彻底失去修正能力，
-                                            只剩前馈开环，"能前进但不打舵"多半就是它。 */
+#define YAW_PID_KP                 5.0f  /* 差速 PWM / 角速度误差。
+                                            P 只补前馈的残差。实测对象增益 K≈615 dps per m/s，
+                                            闭环增益 b=K×ykp/5500：ykp=10 时 b≈1.12（临界，实测
+                                            车身角速度在 94~118 dps 之间来回摆），
+                                            ykp=5 时 b≈0.56，配合前馈 a=K×yff≈1.0 更稳。
+                                            这个值设成 0 会让角速度环只剩开环前馈，
+                                            "能前进但不打舵"多半就是它。 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
 #define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
@@ -193,18 +193,18 @@ static volatile uint16_t fault_ccr_r;
    必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
 #define YAW_DIFF_PWM_PER_MPS       5500.0f
 /* 角速度前馈：按目标角速度直接给差速（m/s 每 dps）。
-   实测标定（2026-11-12，spd=0.8、yt=90、ykp=0）：
-   指令 diff=0.216 时陀螺仪只测到 77 dps，等效换算 K≈356 dps per m/s，
-   所以 yff = 1/K ≈ 0.0028 才能让实测角速度跟上目标。
-   理论值 2×57.3/轮距（轮距 0.18 m 时约 636）偏大一倍，
-   原因是右侧轮目标接近 1 m/s 时速度环追不满，实际差速小于指令差速。 */
-#define YAW_DIFF_FF_MPS_PER_DPS    0.0028f
+   实测标定（2026-11-12）：由 odom 反推实际差速 0.169 m/s 时陀螺仪测到 104 dps，
+   即对象增益 K≈615 dps per m/s（等价轮距 2×57.3/615≈0.186 m）。
+   取 yff = 1/K ≈ 0.0016 是"稳态刚好跟上"的理论值；
+   但速度环追不满指令差速（右轮目标接近 0.85 m/s 时实测只有 0.74），
+   所以取 0.0025 略高于理论值，用一点超前来抵消执行机构的滞后。 */
+#define YAW_DIFF_FF_MPS_PER_DPS    0.0025f
 /* 单次差速偏置上限，防止饱和打转。 */
 #define YAW_DIFF_LIMIT_MPS         0.40f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
 #define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
-#define SPEED_INTEGRAL_LIMIT       5.0f
+#define SPEED_INTEGRAL_LIMIT       2.0f
 
 /* ---------------- 在线整定（逐飞助手 / 无线串口） ----------------
    上面这些增益与死区在运行时可被串口改写，断电后恢复为宏里的值。
