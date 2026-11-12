@@ -140,6 +140,12 @@
    实测日志里丢线后 target 一直是 300、diff 0.70，紧接着就彻底丢线并停机，
    正是这个固定保持造成的。 */
 #define LINE_LOST_DECAY            0.93f
+/* 衰减期结束后进入「直行搜索」，再给这么长时间找回线才真正停机。
+   停车是最后手段：比赛里车一旦停住，这一圈就废了，直行搜索远比停车好。 */
+#define LINE_LOST_SEARCH_MS        1200U
+#define LINE_LOST_SEARCH_TICKS     ((LINE_LOST_HOLD_MS + LINE_LOST_SEARCH_MS) / CONTROL_UPDATE_MS)
+/* 直行搜索时的车速比例，别跑太远。 */
+#define LINE_SEARCH_SPEED_SCALE    0.70f
 
 /* 发车后目标速度的爬升率，避免目标速度阶跃造成打滑和电流冲击。 */
 #define CONTROL_ACCEL_LIMIT_MPS2   1.0f
@@ -550,6 +556,8 @@ static float yaw_prev_rate;
 static float yaw_rate_derivative;
 /* Z 字弯检测用的上一拍偏差（判断是否发生了左右翻转）。 */
 static int16_t prev_line_error_milli;
+/* 是否处于丢线后的直行搜索阶段（主循环用来缩放车速）。 */
+static volatile uint8_t line_searching;
 /* 内轮反转自检：目标为负但实测仍向前跑满 REV_CHECK_MS 就打一次标记。 */
 static volatile uint8_t rev_fail_flag;
 static uint16_t rev_check_ticks;
@@ -1381,6 +1389,7 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   corner_ticks = 0U;
   corner_detect_ticks = 0U;
   corner_cooldown_ticks = 0U;
+  line_searching = 0U;
   control_turn_pwm = 0.0f;
   control_base_pwm = 0.0f;
   control_speed_target_mps = 0.0f;
@@ -1569,18 +1578,32 @@ static void VehicleControl_Update(void)
       {
       /* 十字路口、虚线或飞线造成的短暂丢线：保持最后一次偏差继续盲开，
          角速度环仍由陀螺仪闭环以维持航向；超时仍无信号才停机。 */
-      if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
+      if (line_lost_ticks < 0xFFFFU)
         ++line_lost_ticks;
-
-      if (line_lost_ticks >= LINE_LOST_HOLD_TICKS)
+      if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
+      {
+        /* 保持期间偏差按指数衰减：短暂丢线仍能维持转向，长丢线则迅速摆正。
+           微分必须置 0，否则误差会持续累积。 */
+        line_error = line_state.previous_error * LINE_LOST_DECAY;
+      }
+      else if (line_lost_ticks < LINE_LOST_SEARCH_TICKS)
+      {
+        /* 长丢线（冲出弯道、或车头摆得太大把线甩出传感器视野）：
+           绝对不要停车！一旦停机就再也找不回线，这一圈直接废掉。
+           改为「直行搜索」——差速清零、保持车速继续往前开，
+           线一回到传感器视野，P 项立刻接管。
+           实测日志里正是这种情况：误差已经从 -4.42 收敛到 0，控制完全正常，
+           却因为连续 300 ms 没读到线被判丢线并停机，车停在赛道上不动。 */
+        line_error = 0.0f;
+        line_state.previous_error = 0.0f;
+        line_state.initialized = 0U;
+        line_searching = 1U;
+      }
+      else
       {
         VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
         return;
       }
-
-      /* 保持期间偏差按指数衰减：短暂丢线仍能维持转向，长丢线则迅速摆正。
-         微分必须置 0，否则误差会持续累积。 */
-      line_error = line_state.previous_error * LINE_LOST_DECAY;
       line_derivative = 0.0f;
     }
     else
@@ -1618,6 +1641,7 @@ static void VehicleControl_Update(void)
       line_hist_index = (i >= LINE_DERIV_SPAN) ? 0U : i;
       prev_line_error_milli = line_error_milli;
       line_lost_ticks = 0U;
+      line_searching = 0U;
     }
     control_target_yaw_rate_dps = Control_Clamp(
         (tune_line_kp * Control_ShapeLineError(line_error)) + (tune_line_kd * line_derivative),
@@ -1769,6 +1793,11 @@ static void VehicleControl_Update(void)
     {
       /* 直角弯转角阶段同样降速，避免原地转时外侧轮顶到极限。 */
       speed_target *= 0.80f;
+    }
+    else if (line_searching != 0U)
+    {
+      /* 丢线直行搜索：慢一点跑，别一下子冲出很远。 */
+      speed_target *= LINE_SEARCH_SPEED_SCALE;
     }
     else if (magnitude >= CORNER_SLOW_ERR_FULL)
     {
