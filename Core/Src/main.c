@@ -403,6 +403,13 @@ static volatile float tune_yaw_ff = YAW_DIFF_FF_MPS_PER_DPS;
    串口 ctrl 帧里能直接对比 target 与实测 yaw，判断增益是否合适。
    |yt| < 1 表示退出测试、回到正常循迹。 */
 static volatile float tune_yaw_test_dps = 0.0f;
+
+/* 角速度环阶跃测试是否生效（yt 非 0）。测试期间会自动静音循迹与编码器打印，
+   只留 ctrl 帧，避免几十行/秒的滚动把角速度读数冲掉。 */
+static uint8_t YawTest_Active(void)
+{
+  return ((tune_yaw_test_dps > -1.0f) && (tune_yaw_test_dps < 1.0f)) ? 0U : 1U;
+}
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -1740,7 +1747,7 @@ int main(void)
 #if LINE_SENSOR_DEBUG
     {
       static uint32_t line_print_tick;
-      if ((debug_print_on != 0U) &&
+      if ((debug_print_on != 0U) && (YawTest_Active() == 0U) &&
           ((HAL_GetTick() - line_print_tick) >= LINE_PRINT_MS))
       {
         line_print_tick = HAL_GetTick();
@@ -1775,7 +1782,7 @@ int main(void)
     }
     {
       static uint32_t speed_print_tick;
-      if ((debug_print_on != 0U) &&
+      if ((debug_print_on != 0U) && (YawTest_Active() == 0U) &&
           ((HAL_GetTick() - speed_print_tick) >= SPEED_PRINT_MS))
       {
         speed_print_tick = HAL_GetTick();
