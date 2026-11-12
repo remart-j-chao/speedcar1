@@ -185,11 +185,15 @@ static volatile uint16_t fault_ccr_r;
                                             线性映射（除以 3 拉平后）在 err=1 时给 35 dps，
                                             直道太抖；err=6 时只给 210 dps，急弯又不够。
                                             这才是"直道画龙 + 弯道冲出去"同时出现的根源。 */
-#define LINE_PD_KD                 0.3f  /* 目标角速度 / 循迹误差变化率（提前量）。
+#define LINE_PD_KD                 0.8f  /* 目标角速度 / 循迹误差变化率（提前量）。
                                            单位是 (dps)/(权重/秒)：偏差每 10 ms 变化 1 个权重
-                                           就是 100 单位/秒，所以 0.3 约给 30 dps —— 用来
-                                           在进弯瞬间提前打舵，弥补串联双环固有的滞后。
-                                           直道画龙就减到 0.15，进弯仍然迟就加到 0.5。 */
+                                           就是 100 单位/秒，所以 0.8 约给 80 dps 的提前量。
+                                           串联双环从"看见偏差"到"车身转起来"有 150 ms 以上的滞后，
+                                           等 P 项把误差放大到 4 路以上再打舵已经来不及了，
+                                           进弯提前量只能靠 D 给。0.3 时只有 30 dps，杯水车薪。
+                                           直道抖动靠 LINE_DERIV_FILTER 压住。 */
+/* 微分一阶低通系数（0~1，越大越平滑）。 */
+#define LINE_DERIV_FILTER          0.6f
 /* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
    必须与角速度环的方向一致：
    差速为正 → 左轮慢右轮快 → 车向左（逆时针）转；
@@ -1336,7 +1340,8 @@ static void VehicleControl_Update(void)
   static float yaw_rate_filtered;
   const float dt = (float)CONTROL_UPDATE_MS / 1000.0f;
   float line_error;
-  float line_derivative;
+  /* 微分必须跨周期保留，否则一阶低通每 10 ms 都被重置，滤波等于没做。 */
+  static float line_derivative;
   float yaw_rate;
   float yaw_error;
   float yaw_derivative;
@@ -1408,8 +1413,18 @@ static void VehicleControl_Update(void)
       /* 将循迹误差从千分之一权重还原为传感器权重。 */
       line_error = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
       /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
-      line_derivative = ((line_state.initialized != 0U) && (line_lost_ticks == 0U)) ?
-                        (line_error - line_state.previous_error) / dt : 0.0f;
+      if ((line_state.initialized != 0U) && (line_lost_ticks == 0U))
+      {
+        float derivative_raw = (line_error - line_state.previous_error) / dt;
+        /* 光电管是离散的，微分会带 ±100 单位/秒的量化尖峰；
+           一阶低通既压住噪声，又保留进弯时的主要趋势，才能把 D 项真正用起来。 */
+        line_derivative = (LINE_DERIV_FILTER * line_derivative) +
+                          ((1.0f - LINE_DERIV_FILTER) * derivative_raw);
+      }
+      else
+      {
+        line_derivative = 0.0f;
+      }
       line_lost_ticks = 0U;
     }
     control_target_yaw_rate_dps = Control_Clamp(
