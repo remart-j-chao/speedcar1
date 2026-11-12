@@ -201,6 +201,19 @@ static volatile uint16_t fault_ccr_r;
                                            就先打一点方向；但给太多会和量化噪声一起变成抖动源。 */
 /* 微分窗口（采样次数）：用 30 ms 差商代替 10 ms 单步差分，压掉整数跳变尖峰。 */
 #define LINE_DERIV_SPAN            3U
+/* 差商限幅（权重/秒）：防止 Z 字弯换向瞬间差商把 D 项打爆。
+   100 对应"30 ms 内变化 3 个权重"，正常过弯达不到，只有换向才有。 */
+#define LINE_DERIV_LIMIT           100.0f
+/* ---------------- Z 字弯 / 连续 S 弯 ----------------
+   光电管视野有限，高速下车头刚摆过来，线已经跑出传感器。
+   偏差一大就主动降速，让车有时间把姿态换过去，线回到中间后再提速。 */
+/* 偏差超过该值开始降速，到第二个值降到最低比例。 */
+#define CORNER_SLOW_ERR_START      2.0f
+#define CORNER_SLOW_ERR_FULL       4.5f
+/* 降速后的车速比例（0.55 表示剩 55%）。 */
+#define CORNER_SLOW_MIN_SCALE      0.55f
+/* 减速比加速更急：加速 1 m/s²，减速 4 m/s²，否则进弯前来不及降下来。 */
+#define CONTROL_DECEL_LIMIT_MPS2   4.0f
 /* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
    必须与角速度环的方向一致：
    差速为正 → 左轮慢右轮快 → 车向左（逆时针）转；
@@ -219,7 +232,15 @@ static volatile uint16_t fault_ccr_r;
                                             这个值设成 0 会让角速度环只剩开环前馈，
                                             "能前进但不打舵"多半就是它。 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
-#define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
+#define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率（未用） */
+/* 陀螺仪阻尼（差速 PWM 每 (dps/s)）：对实测角速度求微分后反向叠加。
+   Z 字弯里车身刚转过一个弯、惯性还在往原方向甩时，这一项会立刻给出反向差速
+   把车头拽回来，作用相当于给转向轴加一个阻尼器。
+   实测角速度 100 ms 内变化 300 dps 时（3000 dps/s），0.05 会给 150 PWM 的阻尼，
+   相当于 ykp 项在 30 dps 误差下的输出，量级合适。 */
+#define YAW_RATE_DAMP              0.05f
+/* 角速度微分的限幅（dps/s），防止噪声或跳变把阻尼项打爆。 */
+#define YAW_RATE_DERIV_LIMIT       6000.0f
 #define SPEED_PI_KP                200.0f  /* 基础 PWM / 速度误差。
                                               实测对象增益约 0.0037 m/s per PWM，
                                               Kp=500 时速度环增益 1.85，配合 30 ms 滑窗会
@@ -516,6 +537,12 @@ static uint16_t corner_cooldown_ticks;
    在 10 ms 控制中断里直接打印会拖垮控制周期。 */
 static volatile uint8_t corner_event;        /* 0 无 / 1 进入 / 2 退出 */
 static volatile float   corner_event_angle;
+/* 角速度环的陀螺仪阻尼：对实测角速度求微分，系数与状态在这里。 */
+static volatile float tune_yaw_rate_damp = YAW_RATE_DAMP;
+static float yaw_prev_rate;
+static float yaw_rate_derivative;
+/* Z 字弯检测用的上一拍偏差（判断是否发生了左右翻转）。 */
+static int16_t prev_line_error_milli;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -769,7 +796,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -845,6 +872,14 @@ static void Tune_ApplyParameter(uint8_t index, float value)
       else
         tune_corner_deg = value;
       corner_detect_ticks = 0U;
+      break;
+    case 21U: /* 陀螺仪阻尼系数：ydm=0 关闭，ydm=0.05 默认 */
+      if (value < 0.0f)
+        tune_yaw_rate_damp = 0.0f;
+      else if (value > 0.5f)
+        tune_yaw_rate_damp = 0.5f;
+      else
+        tune_yaw_rate_damp = value;
       break;
     default: return;
   }
@@ -972,6 +1007,7 @@ static void Tune_SetDefaults(void)
   tune_yaw_test_dps = 0.0f;
   tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
   tune_corner_deg = CORNER_TURN_DEG;
+  tune_yaw_rate_damp = YAW_RATE_DAMP;
   tune_stall_enable = 1U;
 }
 
@@ -1105,9 +1141,10 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
-  printf("cfg2,yt=%ld,rev=%ld,c90=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
+  printf("cfg2,yt=%ld,rev=%ld,c90=%ld,ydm=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
          (long)(tune_inner_reverse_mps * 1000.0f),
-         (long)(tune_corner_deg * 10.0f));
+         (long)(tune_corner_deg * 10.0f),
+         (long)(tune_yaw_rate_damp * 1000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1199,7 +1236,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 20U; ++k)
+  for (k = 0U; k < 21U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1550,6 +1587,17 @@ static void VehicleControl_Update(void)
            D 项一放大就变成抖动源；30 ms 窗口把尖峰压到 1/3，滞后只多 10 ms。 */
         line_derivative = (line_error - line_error_hist[line_hist_index]) /
                           (dt * (float)LINE_DERIV_SPAN);
+        /* Z 字弯折角处偏差会瞬间从极负跳到极正，此时差商仍会给出巨大尖峰，
+           表现为车身抽一下再反向抽一下（画龙）。两个措施：
+           1) 偏差符号翻转的那一拍直接清零 —— 这不是"趋势"，是换向了；
+           2) 其余情况给差商限幅。 */
+        if (((line_error_milli >= 0) && (prev_line_error_milli < 0)) ||
+            ((line_error_milli < 0) && (prev_line_error_milli > 0)))
+        {
+          line_derivative = 0.0f;
+        }
+        line_derivative = Control_Clamp(line_derivative,
+                                        -LINE_DERIV_LIMIT, LINE_DERIV_LIMIT);
       }
       else
       {
@@ -1558,6 +1606,7 @@ static void VehicleControl_Update(void)
       line_error_hist[line_hist_index] = line_error;
       i = (uint8_t)(line_hist_index + 1U);
       line_hist_index = (i >= LINE_DERIV_SPAN) ? 0U : i;
+      prev_line_error_milli = line_error_milli;
       line_lost_ticks = 0U;
     }
     control_target_yaw_rate_dps = Control_Clamp(
@@ -1573,7 +1622,11 @@ static void VehicleControl_Update(void)
           (line_sensor_valid != 0U) &&
           ((line_error_milli >= CORNER_DETECT_ERR) ||
            (line_error_milli <= -CORNER_DETECT_ERR)) &&
-          (Line_ActiveCount() <= CORNER_DETECT_MAX_ACTIVE))
+          (Line_ActiveCount() <= CORNER_DETECT_MAX_ACTIVE) &&
+          /* Z 字弯的折角处偏差也会瞬间变到极值，但方向上和上一拍相反；
+             要求与上一拍同号，避免把普通 S 弯误判成直角弯。 */
+          (((line_error_milli >= 0) && (prev_line_error_milli >= 0)) ||
+           ((line_error_milli < 0) && (prev_line_error_milli < 0))))
       {
         if (corner_detect_ticks < CORNER_DETECT_TICKS)
           ++corner_detect_ticks;
@@ -1625,12 +1678,22 @@ static void VehicleControl_Update(void)
   yaw_error = control_target_yaw_rate_dps - yaw_rate;
   yaw_derivative = yaw_state.initialized ?
                    (yaw_error - yaw_state.previous_error) / dt : 0.0f;
+  /* 陀螺仪阻尼：对"实测角速度"求微分，而不是对误差求微分。
+     对误差求微分会在目标突变时产生很大的尖峰（setpoint kick），
+     对实测值求微分只反映车身真实的角加速度，Z 字弯切向时靠它抑制过冲。 */
+  yaw_rate_derivative = ((yaw_state.initialized != 0U) &&
+                         (run_ticks > MOTOR_GRACE_TICKS)) ?
+                        (yaw_rate - yaw_prev_rate) / dt : 0.0f;
+  yaw_rate_derivative = Control_Clamp(yaw_rate_derivative,
+                                      -YAW_RATE_DERIV_LIMIT, YAW_RATE_DERIV_LIMIT);
+  yaw_prev_rate = yaw_rate;
   yaw_state.integral = Control_Clamp(yaw_state.integral + yaw_error * dt,
                                      -YAW_INTEGRAL_LIMIT, YAW_INTEGRAL_LIMIT);
   control_turn_pwm = Control_Clamp(
       (tune_yaw_kp * yaw_error) +
       (tune_yaw_ki * yaw_state.integral) +
-      (tune_yaw_kd * yaw_derivative),
+      (tune_yaw_kd * yaw_derivative) -
+      (tune_yaw_rate_damp * yaw_rate_derivative),
       -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   yaw_state.previous_error = yaw_error;
   yaw_state.initialized = 1U;
@@ -1685,7 +1748,28 @@ static void VehicleControl_Update(void)
   {
     /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
        目标值可在运行中改（在线整定），这里取一次快照保证本轮一致。 */
-    const float speed_target = tune_target_speed;
+    float speed_target = tune_target_speed;
+    float magnitude;
+
+    /* 动态降速：偏差越大说明正在急弯里，主动把车速压下来，
+       让车有时间把姿态换过去；线回到中间后自动恢复。
+       Z 字弯（连续反向急弯）靠这一条才不至于惯性累积冲出赛道。 */
+    magnitude = (line_error < 0.0f) ? -line_error : line_error;
+    if (corner_state != 0U)
+    {
+      /* 直角弯转角阶段同样降速，避免原地转时外侧轮顶到极限。 */
+      speed_target *= 0.80f;
+    }
+    else if (magnitude >= CORNER_SLOW_ERR_FULL)
+    {
+      speed_target *= CORNER_SLOW_MIN_SCALE;
+    }
+    else if (magnitude > CORNER_SLOW_ERR_START)
+    {
+      float t = (magnitude - CORNER_SLOW_ERR_START) /
+                (CORNER_SLOW_ERR_FULL - CORNER_SLOW_ERR_START);
+      speed_target *= 1.0f - (t * (1.0f - CORNER_SLOW_MIN_SCALE));
+    }
 
     if (control_speed_target_mps < speed_target)
     {
@@ -1695,7 +1779,8 @@ static void VehicleControl_Update(void)
     }
     else if (control_speed_target_mps > speed_target)
     {
-      control_speed_target_mps -= CONTROL_ACCEL_LIMIT_MPS2 * dt;
+      /* 减速用更大的斜率，否则进弯前来不及降下来。 */
+      control_speed_target_mps -= CONTROL_DECEL_LIMIT_MPS2 * dt;
       if (control_speed_target_mps < speed_target)
         control_speed_target_mps = speed_target;
     }
