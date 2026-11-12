@@ -371,6 +371,8 @@ static uint8_t  gyro_bias_latched;
 
 /* 控制器中间量与限幅后的左右轮 PWM，便于调试器查看。 */
 static volatile float control_target_yaw_rate_dps;
+static volatile float control_measured_yaw_rate_dps;
+static volatile float control_yaw_diff_mps;
 static volatile float control_turn_pwm;
 static volatile float control_base_pwm;
 static volatile uint16_t control_left_pwm;
@@ -396,6 +398,11 @@ static const float yaw_rate_filter_alpha = 0.5f;
 static volatile float tune_gyro_trim = GYRO_TRIM_DPS;
 /* 角速度前馈系数（m/s 每 dps）：直接决定"能不能转过急弯"，可在线调。 */
 static volatile float tune_yaw_ff = YAW_DIFF_FF_MPS_PER_DPS;
+/* 角速度环阶跃测试（yt 命令，dps）：非 0 时忽略循迹、直接把该值当作目标角速度。
+   用于阶段 7 单独标定角速度环：车会按 半径 = 速度/(目标角速度) 画圆，
+   串口 ctrl 帧里能直接对比 target 与实测 yaw，判断增益是否合适。
+   |yt| < 1 表示退出测试、回到正常循迹。 */
+static volatile float tune_yaw_test_dps = 0.0f;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -639,7 +646,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -681,7 +688,25 @@ static void Tune_ApplyParameter(uint8_t index, float value)
         line_polarity_locked = 1U;
       }
       break;
-    default:  return;
+    case 18U: /* 角速度环阶跃测试：yt=60 表示强制目标 +60 dps，yt=0 回到循迹 */
+      if ((value > -1.0f) && (value < 1.0f))
+      {
+        tune_yaw_test_dps = 0.0f;
+      }
+      else if (value > CONTROL_MAX_YAW_RATE_DPS)
+      {
+        tune_yaw_test_dps = CONTROL_MAX_YAW_RATE_DPS;
+      }
+      else if (value < -CONTROL_MAX_YAW_RATE_DPS)
+      {
+        tune_yaw_test_dps = -CONTROL_MAX_YAW_RATE_DPS;
+      }
+      else
+      {
+        tune_yaw_test_dps = value;
+      }
+      break;
+    default: return;
   }
   printf("set,%u,%ld\r\n", (unsigned int)index, (long)(value * 1000.0f));
 }
@@ -803,6 +828,8 @@ static void Tune_SetDefaults(void)
   tune_gyro_trim    = GYRO_TRIM_DPS;
   tune_yaw_ff       = YAW_DIFF_FF_MPS_PER_DPS;
   tune_line_sign    = LINE_ERROR_SIGN;
+  /* 阶跃测试不属于标定参数，恢复默认时一并退出，避免发车后车莫名画圈。 */
+  tune_yaw_test_dps = 0.0f;
   tune_stall_enable = 1U;
 }
 
@@ -936,6 +963,7 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
+  printf("cfg2,yt=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1027,7 +1055,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 17U; ++k)
+  for (k = 0U; k < 18U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1153,6 +1181,8 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   speed_right_state->initialized = 0U;
 
   control_target_yaw_rate_dps = 0.0f;
+  control_measured_yaw_rate_dps = 0.0f;
+  control_yaw_diff_mps = 0.0f;
   control_turn_pwm = 0.0f;
   control_base_pwm = 0.0f;
   control_speed_target_mps = 0.0f;
@@ -1257,37 +1287,53 @@ static void VehicleControl_Update(void)
   if (run_ticks < 0xFFFFU)
     ++run_ticks;
 
-  if (line_sensor_valid == 0U)
+  if ((tune_yaw_test_dps > -1.0f) && (tune_yaw_test_dps < 1.0f))
   {
-    /* 十字路口、虚线或飞线造成的短暂丢线：保持最后一次偏差继续盲开，
-       角速度环仍由陀螺仪闭环以维持航向；超时仍无信号才停机。 */
-    if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
-      ++line_lost_ticks;
-
-    if (line_lost_ticks >= LINE_LOST_HOLD_TICKS)
+    if (line_sensor_valid == 0U)
     {
-      VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
-      return;
-    }
+      /* 十字路口、虚线或飞线造成的短暂丢线：保持最后一次偏差继续盲开，
+         角速度环仍由陀螺仪闭环以维持航向；超时仍无信号才停机。 */
+      if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
+        ++line_lost_ticks;
 
-    /* 保持期间偏差不变，微分必须置 0，否则误差会持续累积 */
-    line_error = line_state.previous_error;
-    line_derivative = 0.0f;
+      if (line_lost_ticks >= LINE_LOST_HOLD_TICKS)
+      {
+        VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
+        return;
+      }
+
+      /* 保持期间偏差不变，微分必须置 0，否则误差会持续累积 */
+      line_error = line_state.previous_error;
+      line_derivative = 0.0f;
+    }
+    else
+    {
+      /* 将循迹误差从千分之一权重还原为传感器权重。 */
+      line_error = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
+      /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
+      line_derivative = ((line_state.initialized != 0U) && (line_lost_ticks == 0U)) ?
+                        (line_error - line_state.previous_error) / dt : 0.0f;
+      line_lost_ticks = 0U;
+    }
+    control_target_yaw_rate_dps = Control_Clamp(
+        (tune_line_kp * line_error) + (tune_line_kd * line_derivative),
+        -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
+    line_state.previous_error = line_error;
+    line_state.initialized = 1U;
   }
   else
   {
-    /* 将循迹误差从千分之一权重还原为传感器权重。 */
-    line_error = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
-    /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
-    line_derivative = ((line_state.initialized != 0U) && (line_lost_ticks == 0U)) ?
-                      (line_error - line_state.previous_error) / dt : 0.0f;
+    /* 角速度环阶跃测试：忽略循迹（也忽略丢线停机），直接给定目标角速度，
+       这样可以在没有赛道的情况下单独验证角速度环的跟踪与稳定性。 */
+    line_error = 0.0f;
+    line_derivative = 0.0f;
+    line_state.previous_error = 0.0f;
+    line_state.initialized = 0U;
     line_lost_ticks = 0U;
+    control_target_yaw_rate_dps = Control_Clamp(tune_yaw_test_dps,
+                                               -CONTROL_MAX_YAW_RATE_DPS,
+                                               CONTROL_MAX_YAW_RATE_DPS);
   }
-  control_target_yaw_rate_dps = Control_Clamp(
-      (tune_line_kp * line_error) + (tune_line_kd * line_derivative),
-      -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
-  line_state.previous_error = line_error;
-  line_state.initialized = 1U;
 
   /* 目标角速度与扣除零偏后的 BMI270 Z 轴角速度之差由 PID 转为差速偏置。
      安装方向修正只作用在这里：调试打印的 gyro_z 始终是传感器原始方向。 */
@@ -1298,6 +1344,7 @@ static void VehicleControl_Update(void)
   yaw_rate = yaw_rate_filtered;
   if ((yaw_rate < GYRO_DEADBAND_DPS) && (yaw_rate > -GYRO_DEADBAND_DPS))
     yaw_rate = 0.0f;
+  control_measured_yaw_rate_dps = yaw_rate;
   yaw_error = control_target_yaw_rate_dps - yaw_rate;
   yaw_derivative = yaw_state.initialized ?
                    (yaw_error - yaw_state.previous_error) / dt : 0.0f;
@@ -1336,6 +1383,7 @@ static void VehicleControl_Update(void)
       (tune_yaw_ff * control_target_yaw_rate_dps) +
       (control_turn_pwm / YAW_DIFF_PWM_PER_MPS),
       -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
+  control_yaw_diff_mps = yaw_differential_mps;
 
   {
     /* 目标速度按加速度上限爬升，避免发车瞬间阶跃造成打滑。
@@ -1744,7 +1792,7 @@ int main(void)
           ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS))
       {
         control_print_tick = HAL_GetTick();
-        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u\r\n",
+        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u,%ld,%ld\r\n",
                (unsigned int)run_button_started,
                (unsigned int)line_sensor_valid,
                (unsigned int)imu_ready,
@@ -1752,7 +1800,9 @@ int main(void)
                (long)(control_turn_pwm * 1000.0f),
                (long)(control_base_pwm * 1000.0f),
                (unsigned int)control_left_pwm,
-               (unsigned int)control_right_pwm);
+               (unsigned int)control_right_pwm,
+               (long)(control_measured_yaw_rate_dps * 1000.0f),
+               (long)(control_yaw_diff_mps * 1000.0f));
       }
     }
 #endif
