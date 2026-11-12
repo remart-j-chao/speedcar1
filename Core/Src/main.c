@@ -556,6 +556,9 @@ static float yaw_rate_derivative;
 static int16_t prev_line_error_milli;
 /* 是否处于丢线后的直行搜索阶段（主循环用来缩放车速）。 */
 static volatile uint8_t line_searching;
+/* 丢线后是否继续直行搜索：0 = 直接停机（默认），1 = 继续开 1.2 s 找线。
+   可在运行中用 srch 命令切换。 */
+static volatile float tune_search_enable = 0.0f;
 /* 内轮反转自检：目标为负但实测仍向前跑满 REV_CHECK_MS 就打一次标记。 */
 static volatile uint8_t rev_fail_flag;
 static uint16_t rev_check_ticks;
@@ -812,7 +815,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm", "srch"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -896,6 +899,11 @@ static void Tune_ApplyParameter(uint8_t index, float value)
         tune_yaw_rate_damp = 0.5f;
       else
         tune_yaw_rate_damp = value;
+      break;
+    case 22U: /* 丢线后是否直行搜索：srch=0 停机（默认），srch=1 继续找线 */
+      tune_search_enable = (value > 0.5f) ? 1.0f : 0.0f;
+      if (tune_search_enable < 0.5f)
+        line_searching = 0U;
       break;
     default: return;
   }
@@ -1024,6 +1032,7 @@ static void Tune_SetDefaults(void)
   tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
   tune_corner_deg = CORNER_TURN_DEG;
   tune_yaw_rate_damp = YAW_RATE_DAMP;
+  tune_search_enable = 0.0f;
   tune_stall_enable = 1U;
 }
 
@@ -1157,10 +1166,11 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
-  printf("cfg2,yt=%ld,rev=%ld,c90=%ld,ydm=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
+  printf("cfg2,yt=%ld,rev=%ld,c90=%ld,ydm=%ld,srch=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
          (long)(tune_inner_reverse_mps * 1000.0f),
          (long)(tune_corner_deg * 10.0f),
-         (long)(tune_yaw_rate_damp * 1000.0f));
+         (long)(tune_yaw_rate_damp * 1000.0f),
+         (long)tune_search_enable);
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1252,7 +1262,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 21U; ++k)
+  for (k = 0U; k < 22U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1584,14 +1594,12 @@ static void VehicleControl_Update(void)
            微分必须置 0，否则误差会持续累积。 */
         line_error = line_state.previous_error * LINE_LOST_DECAY;
       }
-      else if (line_lost_ticks < LINE_LOST_SEARCH_TICKS)
+      else if ((tune_search_enable > 0.5f) &&
+               (line_lost_ticks < LINE_LOST_SEARCH_TICKS))
       {
-        /* 长丢线（冲出弯道、或车头摆得太大把线甩出传感器视野）：
-           绝对不要停车！一旦停机就再也找不回线，这一圈直接废掉。
-           改为「直行搜索」——差速清零、保持车速继续往前开，
-           线一回到传感器视野，P 项立刻接管。
-           实测日志里正是这种情况：误差已经从 -4.42 收敛到 0，控制完全正常，
-           却因为连续 300 ms 没读到线被判丢线并停机，车停在赛道上不动。 */
+        /* 可选：丢线后不停车，直行搜索（用 srch=1 打开，默认关闭）。
+           差速清零、保持车速继续往前开，线一回到传感器视野 P 项立刻接管。
+           代价是车会继续往赛道外跑，所以默认不开。 */
         line_error = 0.0f;
         line_state.previous_error = 0.0f;
         line_state.initialized = 0U;
@@ -1599,6 +1607,7 @@ static void VehicleControl_Update(void)
       }
       else
       {
+        /* 默认行为：丢线超过保持窗口就停机。 */
         VehicleControl_Reset(&line_state, &yaw_state, &speed_left_state, &speed_right_state);
         return;
       }
