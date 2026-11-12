@@ -118,6 +118,14 @@
 /* 内侧轮反转时的最低 CCR。低于这个值电机几乎没有扭矩，
    会被地面"拖着正转"，转速差就做不出来（实测 CCR 288 仍被拖到 +0.22 m/s）。 */
 #define MOTOR_CCR_HOLD          340.0f
+/* 正/反转切换的迟滞（m/s）。没有迟滞的话，目标速度在 0 附近抖动时
+   DIR 脚会每 10 ms 翻一次，CCR 在 ~170 和 340 之间跳，车就左右抖。 */
+#define TURN_REV_ENTER_MPS      0.030f
+#define TURN_REV_LEAVE_MPS      0.010f
+/* 识别到分叉（环岛入口）后强制拐多久；以及之后多久不再重新认分叉。
+   不设时限的话车进了环岛会一直"认分叉"，绕不出来。 */
+#define BRANCH_HOLD_TICKS       30U      /* 30 × 10 ms = 300 ms */
+#define BRANCH_COOL_TICKS       200U     /* 2 s */
 #define SPEED_KP_CCR            300.0f
 #define SPEED_KI_CCR            6000.0f
 /* 积分项的**输出**上限（CCR）。积分只补前馈残差，不需要很大，也避免绕圈。 */
@@ -126,6 +134,8 @@
 /* ---------------- 安全 ---------------- */
 #define LINE_LOST_STOP_MS       300U     /* 丢线超过此时间就停机 */
 #define LINE_LOST_STOP_TICKS    (LINE_LOST_STOP_MS / CTRL_PERIOD_MS)
+/* 丢线搜索期间把基本车速降到这个比例：原地转比往前冲更容易把线扫回来 */
+#define LINE_SEARCH_SPEED_SCALE 0.35f
 #define STALL_MS                800U
 #define STALL_TICKS             (STALL_MS / CTRL_PERIOD_MS)
 #define STALL_CCR_MIN           300.0f   /* 左右至少一轮给到这么多 CCR 才算"在驱动" */
@@ -295,8 +305,11 @@ static int32_t  enc_sum_l, enc_sum_r;
 /* ---- 控制器状态 ---- */
 static float line_prev_err;    /* 上一拍偏差，用于差分 */
 static float line_d_lpf;       /* 偏差变化率低通状态 */
-static float speed_i_l, speed_i_r;  /* 每轮速度环积分（CCR 单位） */
+static float speed_i_l, speed_i_r;  /* 每轮速度环积分（直接是 CCR 输出） */
 static float spd_ramp;         /* 目标速度斜坡状态 */
+static float dir_l_state = 1.0f, dir_r_state = 1.0f;  /* 每轮当前驱动方向，带迟滞 */
+static uint16_t branch_ticks;  /* 分叉强制转向剩余拍数 */
+static uint16_t branch_cool;   /* 分叉冷却剩余拍数 */
 static volatile float dbg_turn_mps;
 static volatile float dbg_err;
 static volatile int16_t dbg_ccr_l, dbg_ccr_r;
@@ -349,18 +362,18 @@ static uint16_t Line_ActiveCount(uint16_t bits)
 }
 
 /* 压线过多时（十字、环岛入口、宽黑区）加权平均会被拉向中间，
-   直接用会"看见分叉却当没看见"。这里分两种情况处理：
+   直接用会"看见分叉却当没看见"。按压线通道是否"分成几段"来区分：
 
-   1) 压线通道**中间有断档**（例如 1100011，左右各一段）：
-      这是"分叉/环岛入口"——主线 + 旁边支线同时被看到。
-      取"离中心更远的那一段"的加权平均，才能真的拐进去。
+   1) 中间有断档（例如 1100011，左右各一段）= 分叉/环岛入口。
+      取"平均位置离中心最远的那一段"，才能真的拐进去。
+      返回值 *out 为这一段自己的加权平均，函数返回 1。
 
-   2) 压线通道**连续**（例如 00111100）：
-      这是宽线/十字路口的黑区。取最左最右的中点：
-      对称的十字 -> 0（直行），一侧偏 -> 跟着偏。
+   2) 连续的一段（例如 00111100）= 宽线/十字路口黑区。
+      用最左最右的中点：对称十字 -> 0（直行），一侧偏 -> 跟着偏。
+      函数返回 0。
 
-   返回单位与 line_error_milli 一致（千分之一权重）。 */
-static int16_t Line_WideError(void)
+   两种情况的单位都与 line_error_milli 一致（千分之一权重）。 */
+static uint8_t Line_WideError(int16_t *out)
 {
   int32_t run_sum[4];
   uint16_t run_cnt[4];
@@ -368,6 +381,8 @@ static int16_t Line_WideError(void)
   uint8_t runs = 0U, best = 0U, i;
   uint8_t prev_active = 0U;
   uint16_t ch;
+
+  *out = 0;
 
   for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
   {
@@ -393,27 +408,30 @@ static int16_t Line_WideError(void)
     prev_active = active;
   }
 
-  if (runs == 0U) return 0;
+  if (runs == 0U) return 0U;
 
   if (runs == 1U)
   {
-    /* 连续宽线：用最左最右的中点 */
     int16_t first = run_first[0];
     int16_t last = (int16_t)(run_first[0] + (int16_t)run_cnt[0] - 1);
     int32_t w_first = (first < 6) ? ((int32_t)first - 6L) : ((int32_t)first - 5L);
     int32_t w_last  = (last  < 6) ? ((int32_t)last  - 6L) : ((int32_t)last  - 5L);
-    return (int16_t)(((w_first + w_last) * LINE_ERROR_SCALE) / 2L);
+
+    *out = (int16_t)(((w_first + w_last) * LINE_ERROR_SCALE) / 2L);
+    return 0U;
   }
 
-  /* 多段（分叉）：取"平均位置离中心最远"的那一段 */
+  /* 多段：取"平均位置离中心最远"的那一段 */
   for (i = 1U; i < runs; ++i)
   {
     int32_t a = (run_sum[i] < 0) ? -run_sum[i] : run_sum[i];
     int32_t b = (run_sum[best] < 0) ? -run_sum[best] : run_sum[best];
     if (a > b) best = i;
   }
-  if (run_cnt[best] == 0U) return 0;
-  return (int16_t)((run_sum[best] * LINE_ERROR_SCALE) / (int32_t)run_cnt[best]);
+  if (run_cnt[best] == 0U) return 0U;
+
+  *out = (int16_t)((run_sum[best] * LINE_ERROR_SCALE) / (int32_t)run_cnt[best]);
+  return 1U;
 }
 
 /* 读 12 路光电管，算出加权平均偏差。
@@ -506,6 +524,10 @@ static void RunButton_Update(void)
       speed_i_l = 0.0f;
       speed_i_r = 0.0f;
       spd_ramp = 0.0f;
+      dir_l_state = 1.0f;
+      dir_r_state = 1.0f;
+      branch_ticks = 0U;
+      branch_cool = 0U;
       dbg_turn_mps = 0.0f;
       dbg_err = 0.0f;
       TIM1->CCR1 = 0U;
@@ -523,6 +545,7 @@ static void Control_Update(void)
   float turn;               /* 转向量，m/s，正 = 右转 */
   float v_target, t_l, t_r;
   float ccr_l, ccr_r;
+  float search_scale = 1.0f; /* 丢线搜索时降低基本车速 */
 
   /* 未发车 / 故障：停机 */
   if ((run_on == 0U) || (fault_code != 0U))
@@ -534,6 +557,10 @@ static void Control_Update(void)
     line_prev_err = 0.0f;
     line_d_lpf = 0.0f;
     spd_ramp = 0.0f;
+    dir_l_state = 1.0f;
+    dir_r_state = 1.0f;
+    branch_ticks = 0U;
+    branch_cool = 0U;
     dbg_turn_mps = 0.0f;
     dbg_err = 0.0f;
     TIM1->CCR1 = 0U;
@@ -542,6 +569,10 @@ static void Control_Update(void)
   }
 
   if (run_ticks < 0xFFFFU) ++run_ticks;
+
+  /* 分叉强制转向 / 冷却计时 */
+  if (branch_ticks > 0U) --branch_ticks;
+  if (branch_cool > 0U) --branch_cool;
 
   /* ---------- 偏差 ---------- */
   if (line_valid == 0U)
@@ -560,17 +591,37 @@ static void Control_Update(void)
       dbg_turn_mps = 0.0f;
       return;
     }
-    /* 短暂丢线（十字路口 / 虚线 / 折角）：保持上一次偏差继续走几十毫秒 */
+    /* 短暂丢线（十字路口 / 虚线 / 折角）：保持上一次偏差继续走几十毫秒。
+       同时把基本车速降下来——这段是"找线"时间，原地转比往前冲更容易把线扫回来，
+       往前冲就真的冲出赛道了。 */
     err = line_prev_err;
     deriv = 0.0f;
     line_d_lpf *= LINE_D_LPF_ALPHA;
+    search_scale = LINE_SEARCH_SPEED_SCALE;
   }
   else
   {
     int16_t e_milli = line_error_milli;
     uint8_t wide = (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT) ? 1U : 0U;
 
-    if (wide) e_milli = Line_WideError();
+    if (wide)
+    {
+      int16_t we;
+      uint8_t is_branch = Line_WideError(&we);
+
+      if (is_branch)
+      {
+        /* 看到"主线 + 支线"同时压着 = 分叉/环岛入口。
+           只在冷却结束后触发一次短促的强制转向；否则车进了环岛会一直
+           认分叉，绕着不出来。 */
+        if ((branch_ticks == 0U) && (branch_cool == 0U))
+        {
+          branch_ticks = BRANCH_HOLD_TICKS;
+          branch_cool = BRANCH_COOL_TICKS;
+        }
+      }
+      if (branch_ticks > 0U) e_milli = we;
+    }
 
     err = tune_line_sign * ((float)e_milli / (float)LINE_ERROR_SCALE);
     /* 宽黑区里偏差本来就会突变，D 项会给出吓人的反向脉冲，直接掐掉 */
@@ -601,7 +652,7 @@ static void Control_Update(void)
     if (spd_ramp < tune_target) spd_ramp = tune_target;
   }
 
-  v_target = spd_ramp;
+  v_target = spd_ramp * search_scale;
 
   /* turn > 0 表示右转：左轮加速、右轮减速（可以减到反转为负） */
   t_l = Limit(v_target + turn, -tune_inner_rev, SPEED_LIMIT_MPS);
@@ -609,13 +660,33 @@ static void Control_Update(void)
 
   /* ---------- 速度环：每轮独立 PI，输出 CCR + 方向 ---------- */
   {
-    float dir_l = (t_l < 0.0f) ? -1.0f : 1.0f;
-    float dir_r = (t_r < 0.0f) ? -1.0f : 1.0f;
-    float mag_t_l = AbsF(t_l);
-    float mag_t_r = AbsF(t_r);
-    /* 实测速度投影到"命令方向"上，反转时也是正的，PI 就能统一处理 */
-    float e_l = mag_t_l - (speed_l * dir_l);
-    float e_r = mag_t_r - (speed_r * dir_r);
+    float mag_t_l, mag_t_r, e_l, e_r;
+
+    /* 方向迟滞：目标速度在 0 附近时不要来回切正反转，
+       否则 CCR 会在 ~170 和 340 之间跳变，车就左右抖。 */
+    if (dir_l_state > 0.0f)
+    {
+      if (t_l < -TURN_REV_ENTER_MPS) dir_l_state = -1.0f;
+    }
+    else
+    {
+      if (t_l > -TURN_REV_LEAVE_MPS) dir_l_state = 1.0f;
+    }
+    if (dir_r_state > 0.0f)
+    {
+      if (t_r < -TURN_REV_ENTER_MPS) dir_r_state = -1.0f;
+    }
+    else
+    {
+      if (t_r > -TURN_REV_LEAVE_MPS) dir_r_state = 1.0f;
+    }
+
+    /* 方向决定后，实速度投影到该方向上；目标与实际方向不一致时按 0 处理（滑行） */
+    mag_t_l = (t_l * dir_l_state > 0.0f) ? AbsF(t_l) : 0.0f;
+    mag_t_r = (t_r * dir_r_state > 0.0f) ? AbsF(t_r) : 0.0f;
+
+    e_l = mag_t_l - (speed_l * dir_l_state);
+    e_r = mag_t_r - (speed_r * dir_r_state);
 
     if (mag_t_l <= 0.0f)
     {
@@ -630,7 +701,7 @@ static void Control_Update(void)
       ccr_l = tune_ccr_zero + (tune_ccr_per_mp * mag_t_l) +
               (tune_speed_kp * e_l) + speed_i_l;
       /* 反转时给一个扭矩下限，否则电机没劲、被地面拖着正转 */
-      if (dir_l < 0.0f) ccr_l = Limit(ccr_l, tune_hold_ccr, tune_ccr_max);
+      if (dir_l_state < 0.0f) ccr_l = Limit(ccr_l, tune_hold_ccr, tune_ccr_max);
     }
 
     if (mag_t_r <= 0.0f)
@@ -644,16 +715,16 @@ static void Control_Update(void)
                         -SPEED_I_OUT_LIMIT, SPEED_I_OUT_LIMIT);
       ccr_r = tune_ccr_zero + (tune_ccr_per_mp * mag_t_r) +
               (tune_speed_kp * e_r) + speed_i_r;
-      if (dir_r < 0.0f) ccr_r = Limit(ccr_r, tune_hold_ccr, tune_ccr_max);
+      if (dir_r_state < 0.0f) ccr_r = Limit(ccr_r, tune_hold_ccr, tune_ccr_max);
     }
 
     ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
     ccr_r = Limit(ccr_r, 0.0f, tune_ccr_max);
 
     HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin,
-                      (dir_l > 0.0f) ? L_DIR_FORWARD : L_DIR_REVERSE);
+                      (dir_l_state > 0.0f) ? L_DIR_FORWARD : L_DIR_REVERSE);
     HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin,
-                      (dir_r > 0.0f) ? R_DIR_FORWARD : R_DIR_REVERSE);
+                      (dir_r_state > 0.0f) ? R_DIR_FORWARD : R_DIR_REVERSE);
 
     TIM1->CCR1 = (uint16_t)ccr_l;
     TIM1->CCR2 = (uint16_t)ccr_r;
@@ -670,9 +741,9 @@ static void Control_Update(void)
 
       if (atmp > amax) amax = atmp;
       if ((mag_t_l > 0.05f) && (ccr_l >= STALL_CCR_MIN) &&
-          ((speed_l * dir_l) < -STALL_SPEED_MPS)) bad_sign = 1U;
+          ((speed_l * dir_l_state) < -STALL_SPEED_MPS)) bad_sign = 1U;
       if ((mag_t_r > 0.05f) && (ccr_r >= STALL_CCR_MIN) &&
-          ((speed_r * dir_r) < -STALL_SPEED_MPS)) bad_sign = 1U;
+          ((speed_r * dir_r_state) < -STALL_SPEED_MPS)) bad_sign = 1U;
 
       if ((run_ticks > RUN_GRACE_TICKS) &&
           (bad_sign ||
