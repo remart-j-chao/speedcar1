@@ -139,6 +139,11 @@
 #define LINE_LOST_STOP_TICKS    (LINE_LOST_STOP_MS / CTRL_PERIOD_MS)
 /* 丢线搜索期间把基本车速降到这个比例：原地转比往前冲更容易把线扫回来 */
 #define LINE_SEARCH_SPEED_SCALE 0.35f
+/* 丢线搜索时的转向增益（m/s 每权重）。正常循迹是 LINE_KP=0.10，
+   但丢线时保持的偏差往往已经很小（线刚要掉出去的那一刻），
+   按 0.10 算出来的转向量几乎等于直行，车会一直爬行到超时。
+   这里用 1.2，偏差 0.5 就能吃到满舵，车原地扫转去找线。 */
+#define LINE_SEARCH_KP          1.2f
 #define STALL_MS                800U
 #define STALL_TICKS             (STALL_MS / CTRL_PERIOD_MS)
 #define STALL_CCR_MIN           300.0f   /* 左右至少一轮给到这么多 CCR 才算"在驱动" */
@@ -551,6 +556,7 @@ static void Control_Update(void)
   float v_target, t_l, t_r;
   float ccr_l, ccr_r;
   float search_scale = 1.0f; /* 丢线搜索时降低基本车速 */
+  uint8_t searching = 0U;    /* 1 = 正在丢线搜索 */
 
   /* 未发车 / 故障：停机 */
   if ((run_on == 0U) || (fault_code != 0U))
@@ -596,13 +602,14 @@ static void Control_Update(void)
       dbg_turn_mps = 0.0f;
       return;
     }
-    /* 短暂丢线（十字路口 / 虚线 / 折角）：保持上一次偏差继续走几十毫秒。
-       同时把基本车速降下来——这段是"找线"时间，原地转比往前冲更容易把线扫回来，
-       往前冲就真的冲出赛道了。 */
+    /* 短暂丢线（十字路口 / 虚线 / 折角）：保持上一次偏差继续找线。
+       同时把基本车速降下来——这段是"找线"时间，原地扫转比往前冲更容易
+       把线扫回来，往前冲就真的冲出赛道了。 */
     err = line_prev_err;
     deriv = 0.0f;
     line_d_lpf *= LINE_D_LPF_ALPHA;
     search_scale = LINE_SEARCH_SPEED_SCALE;
+    searching = 1U;
   }
   else
   {
@@ -650,8 +657,16 @@ static void Control_Update(void)
   dbg_err = err;
 
   /* ---------- 转向环：PD -> 左右轮速度差 ---------- */
-  turn = (tune_line_kp * err) + (tune_line_kd * line_d_lpf);
-  turn = Limit(turn, -tune_turn_lim, tune_turn_lim);
+  if (searching != 0U)
+  {
+    /* 找线阶段：用更大的增益，让"稍微偏一点"也能产生明显的扫转 */
+    turn = Limit(err * LINE_SEARCH_KP, -tune_turn_lim, tune_turn_lim);
+  }
+  else
+  {
+    turn = (tune_line_kp * err) + (tune_line_kd * line_d_lpf);
+    turn = Limit(turn, -tune_turn_lim, tune_turn_lim);
+  }
   dbg_turn_mps = turn;
 
   /* ---------- 目标速度走斜坡，避免发车瞬间满油门打滑 ---------- */
