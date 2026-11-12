@@ -281,11 +281,11 @@ static volatile uint16_t fault_ccr_r;
    解决办法是不靠光电管，直接用陀螺仪积分出来的航向角闭环转过固定角度。 */
 /* 目标转角（度）。85~90 之间；设 0 可整体关闭该功能。 */
 #define CORNER_TURN_DEG            88.0f
-/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 3 路，
-   即"最外侧的两三路压线、内侧全脱"——这是直角弯的典型特征。
-   4500 对应重心落在最外侧两路之间。 */
-#define CORNER_DETECT_ERR          4500
-#define CORNER_DETECT_MAX_ACTIVE   3U
+/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 4 路，
+   即"最外侧两三路压线、内侧全脱"——这是直角弯的典型特征。
+   3500 对应重心落到外侧 3~4 路，比原来的 4500 更早识别，入弯更及时。 */
+#define CORNER_DETECT_ERR          3500
+#define CORNER_DETECT_MAX_ACTIVE   4U
 /* 连续满足多少个控制周期才认账，避免单帧误触发。 */
 #define CORNER_DETECT_TICKS        2U
 /* 角度到位判据（度）与超时保护。 */
@@ -299,6 +299,10 @@ static volatile uint16_t fault_ccr_r;
 /* 退出后冷却时间，防止刚上线又被同一个弯重复触发。
    Z 字弯的两个折角间隔很短，冷却太长会漏掉第二个折角，故取 150 ms。 */
 #define CORNER_COOLDOWN_MS         150U
+/* 直角弯转角阶段的车速比例（相对基本速）。
+   1.15 表示转角时反而略快一点：车在转的同时还要前进，
+   速度太低会变成原地打转、外侧轮顶到差速上限反而转不动。 */
+#define CORNER_SPEED_SCALE         1.15f
 #define CORNER_COOLDOWN_TICKS      (CORNER_COOLDOWN_MS / CONTROL_UPDATE_MS)
 /* 反转自检窗口：目标为负、实测仍向前超过 400 ms 即判定方向脚没生效。 */
 #define REV_CHECK_MS               400U
@@ -539,6 +543,9 @@ static float yaw_diff_slewed;
 /* 陀螺仪积分出来的航向角（度，正 = 左转）。直角弯状态机用它做绝对角度闭环。 */
 static volatile float control_yaw_angle;
 static volatile float tune_corner_deg = CORNER_TURN_DEG;
+/* 直角弯识别阈值与转角车速比例，都可在运行中用 cth / cspd 命令改写。 */
+static volatile float tune_corner_detect_err = (float)CORNER_DETECT_ERR;
+static volatile float tune_corner_speed_scale = CORNER_SPEED_SCALE;
 static uint8_t  corner_state;            /* 0 = 循迹，1 = 直角弯转角中 */
 static float    corner_target_angle;
 static uint16_t corner_ticks;
@@ -815,7 +822,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm", "srch"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm", "srch", "cth", "cspd"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -904,6 +911,23 @@ static void Tune_ApplyParameter(uint8_t index, float value)
       tune_search_enable = (value > 0.5f) ? 1.0f : 0.0f;
       if (tune_search_enable < 0.5f)
         line_searching = 0U;
+      break;
+    case 23U: /* 直角弯识别阈值（千分之一权重）：cth=3500 默认，越小越灵敏 */
+      if (value < 1000.0f)
+        tune_corner_detect_err = 1000.0f;
+      else if (value > 6000.0f)
+        tune_corner_detect_err = 6000.0f;
+      else
+        tune_corner_detect_err = value;
+      corner_detect_ticks = 0U;
+      break;
+    case 24U: /* 直角弯转角车速比例：cspd=1.15 默认，1.0 为与基本速相同 */
+      if (value < 0.5f)
+        tune_corner_speed_scale = 0.5f;
+      else if (value > 1.6f)
+        tune_corner_speed_scale = 1.6f;
+      else
+        tune_corner_speed_scale = value;
       break;
     default: return;
   }
@@ -1031,6 +1055,8 @@ static void Tune_SetDefaults(void)
   tune_yaw_test_dps = 0.0f;
   tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
   tune_corner_deg = CORNER_TURN_DEG;
+  tune_corner_detect_err = (float)CORNER_DETECT_ERR;
+  tune_corner_speed_scale = CORNER_SPEED_SCALE;
   tune_yaw_rate_damp = YAW_RATE_DAMP;
   tune_search_enable = 0.0f;
   tune_stall_enable = 1U;
@@ -1166,11 +1192,14 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
-  printf("cfg2,yt=%ld,rev=%ld,c90=%ld,ydm=%ld,srch=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
+  printf("cfg2,yt=%ld,rev=%ld,c90=%ld,ydm=%ld,srch=%ld,cth=%ld,cspd=%ld\r\n",
+         (long)(tune_yaw_test_dps * 1000.0f),
          (long)(tune_inner_reverse_mps * 1000.0f),
          (long)(tune_corner_deg * 10.0f),
          (long)(tune_yaw_rate_damp * 1000.0f),
-         (long)tune_search_enable);
+         (long)tune_search_enable,
+         (long)tune_corner_detect_err,
+         (long)(tune_corner_speed_scale * 1000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1262,7 +1291,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 22U; ++k)
+  for (k = 0U; k < 24U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1661,8 +1690,9 @@ static void VehicleControl_Update(void)
          此时记录当前航向角，转入角度闭环强行转过设定角度。 */
       if ((tune_corner_deg > 1.0f) && (corner_cooldown_ticks == 0U) &&
           (line_sensor_valid != 0U) &&
-          ((line_error_milli >= CORNER_DETECT_ERR) ||
-           (line_error_milli <= -CORNER_DETECT_ERR)) &&
+          ((tune_corner_detect_err > 0.0f) && (tune_corner_detect_err < 9999.0f)) &&
+          (((float)line_error_milli >= tune_corner_detect_err) ||
+           ((float)line_error_milli <= -tune_corner_detect_err)) &&
           (Line_ActiveCount() <= CORNER_DETECT_MAX_ACTIVE) &&
           /* Z 字弯的折角处偏差也会瞬间变到极值，但方向上和上一拍相反；
              要求与上一拍同号，避免把普通 S 弯误判成直角弯。 */
@@ -1798,8 +1828,9 @@ static void VehicleControl_Update(void)
     magnitude = (line_error < 0.0f) ? -line_error : line_error;
     if (corner_state != 0U)
     {
-      /* 直角弯转角阶段同样降速，避免原地转时外侧轮顶到极限。 */
-      speed_target *= 0.80f;
+      /* 直角弯转角阶段的车速由 cspd 控制：略快一点反而更好转，
+         太慢会变成原地打转、外侧轮顶到差速上限。 */
+      speed_target *= tune_corner_speed_scale;
     }
     else if (line_searching != 0U)
     {
