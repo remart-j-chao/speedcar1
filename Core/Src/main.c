@@ -175,10 +175,16 @@ static volatile uint16_t fault_ccr_r;
    角速度 Kp 注意尺度：turn→差速换算为 YAW_DIFF_PWM_PER_MPS=5500，
    kp=10 时 10 dps 误差只产生 0.018 m/s 差速（闭环增益约 0.8，稳定区）。
    历史上按旧尺度(550)调出的 80 在本尺度下相当于 800，会让车身持续振荡。 */
-#define LINE_PD_KP                 35.0f /* 目标角速度 / 循迹误差（最大误差 6 → 210 dps，限幅 180）。
-                                            纯 P 循迹的稳态偏差 = 所需角速度 / Kp：
-                                            0.3 m 弯 @0.5 m/s 需 95 dps，Kp=35 时偏差约 2.7 路，
-                                            Kp=20 要 4.8 路（已接近出界），所以不能更小。 */
+#define LINE_PD_KP                 35.0f /* 目标角速度 / 塑形后循迹误差。
+                                            塑形公式 err*|err|/3 后，各误差点的输出为：
+                                              err=1 -> 12 dps   （直道微调，不画龙）
+                                              err=2 -> 47 dps
+                                              err=3 -> 105 dps  （0.3 m 弯所需）
+                                              err=4 -> 187 dps
+                                              err=6 -> 300 dps  （顶到上限，急弯全力）
+                                            线性映射（除以 3 拉平后）在 err=1 时给 35 dps，
+                                            直道太抖；err=6 时只给 210 dps，急弯又不够。
+                                            这才是"直道画龙 + 弯道冲出去"同时出现的根源。 */
 #define LINE_PD_KD                 0.3f  /* 目标角速度 / 循迹误差变化率（提前量）。
                                            单位是 (dps)/(权重/秒)：偏差每 10 ms 变化 1 个权重
                                            就是 100 单位/秒，所以 0.3 约给 30 dps —— 用来
@@ -191,6 +197,9 @@ static volatile uint16_t fault_ccr_r;
    而线偏右（err>0）时必须右转，所以这里取 -1。
    符号错的表现：直道几秒就甩出线，弯道直接冲出赛道（越偏越往外打）。 */
 #define LINE_ERROR_SIGN            (-1.0f)
+/* 循迹误差塑形除数：输出 = err × |err| / 该值。越小越激进，3 是实测折中值。
+   设为 0 或负数即退回线性映射（便于对比）。 */
+#define LINE_ERROR_SHAPE           3.0f
 #define YAW_PID_KP                 5.0f  /* 差速 PWM / 角速度误差。
                                             P 只补前馈的残差。实测对象增益 K≈615 dps per m/s，
                                             闭环增益 b=K×ykp/5500：ykp=10 时 b≈1.12（临界，实测
@@ -451,6 +460,9 @@ static uint8_t YawTest_Active(void)
 {
   return ((tune_yaw_test_dps > -1.0f) && (tune_yaw_test_dps < 1.0f)) ? 0U : 1U;
 }
+/* 内轮允许反转的最大速度（m/s），可在运行中用 rev 命令改写。
+   设为 0 即退回"内轮最低停转"的旧行为，便于一键对比。 */
+static volatile float tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -704,7 +716,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -763,6 +775,14 @@ static void Tune_ApplyParameter(uint8_t index, float value)
       {
         tune_yaw_test_dps = value;
       }
+      break;
+    case 19U: /* 内轮反转上限：rev=0 退回内轮最低停转，rev=0.25 允许反转 */
+      if (value < 0.0f)
+        tune_inner_reverse_mps = 0.0f;
+      else if (value > 0.35f)
+        tune_inner_reverse_mps = 0.35f;
+      else
+        tune_inner_reverse_mps = value;
       break;
     default: return;
   }
@@ -888,6 +908,7 @@ static void Tune_SetDefaults(void)
   tune_line_sign    = LINE_ERROR_SIGN;
   /* 阶跃测试不属于标定参数，恢复默认时一并退出，避免发车后车莫名画圈。 */
   tune_yaw_test_dps = 0.0f;
+  tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
   tune_stall_enable = 1U;
 }
 
@@ -1021,7 +1042,8 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
-  printf("cfg2,yt=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f));
+  printf("cfg2,yt=%ld,rev=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
+         (long)(tune_inner_reverse_mps * 1000.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1113,7 +1135,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 18U; ++k)
+  for (k = 0U; k < 19U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1265,6 +1287,20 @@ static float Control_Clamp(float value, float minimum, float maximum)
   return value;
 }
 
+/* 循迹误差非线性塑形：output = err * |err| / SHAPE。
+   传感器是离散的，正中心附近误差会在 0 和 ±0.67 之间来回跳，
+   线性映射会让直道持续小幅打舵（画龙）；而进弯时误差涨到 3~6，
+   又需要非常大的打舵量才能及时转进去。
+   平方律正好同时满足两头：中心附近增益小 3 倍，大偏差时增益放大 3~6 倍。 */
+static float Control_ShapeLineError(float error)
+{
+  float magnitude = (error < 0.0f) ? -error : error;
+
+  if (LINE_ERROR_SHAPE <= 0.0f)
+    return error;
+  return error * magnitude / LINE_ERROR_SHAPE;
+}
+
 /* 死区补偿：把期望 PWM 线性映射到 [deadzone, CONTROL_MAX_PWM_CCR]。
    占空比很小时也能真正驱动轮子，同时 pwm = 0 时输出仍为 0（可停车）。
    5 PWM 以下直接输出 0：避免内轮在正反转切换点上让 DIR 脚来回抖动。 */
@@ -1377,7 +1413,7 @@ static void VehicleControl_Update(void)
       line_lost_ticks = 0U;
     }
     control_target_yaw_rate_dps = Control_Clamp(
-        (tune_line_kp * line_error) + (tune_line_kd * line_derivative),
+        (tune_line_kp * Control_ShapeLineError(line_error)) + (tune_line_kd * line_derivative),
         -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
     line_state.previous_error = line_error;
     line_state.initialized = 1U;
@@ -1470,9 +1506,9 @@ static void VehicleControl_Update(void)
      这是把差速做大的唯一途径：差速 = (外轮 - 内轮)/2，
      内轮从 0 变成负值后同样的外轮转速能得到近两倍的差速。 */
   speed_target_left = Control_Clamp(control_speed_target_mps - yaw_differential_mps,
-                                    -YAW_INNER_REVERSE_MPS, CONTROL_SPEED_TARGET_LIMIT_MPS);
+                                    -tune_inner_reverse_mps, CONTROL_SPEED_TARGET_LIMIT_MPS);
   speed_target_right = Control_Clamp(control_speed_target_mps + yaw_differential_mps,
-                                     -YAW_INNER_REVERSE_MPS, CONTROL_SPEED_TARGET_LIMIT_MPS);
+                                     -tune_inner_reverse_mps, CONTROL_SPEED_TARGET_LIMIT_MPS);
 
   /* 零速（停车或尚未起步）时不允许任何差速：
      陀螺仪残余零偏会被角速度环放大成一个持续的差速，
