@@ -122,17 +122,20 @@
    DIR 脚会每 10 ms 翻一次，CCR 在 ~170 和 340 之间跳，车就左右抖。 */
 #define TURN_REV_ENTER_MPS      0.030f
 #define TURN_REV_LEAVE_MPS      0.010f
-/* 识别到分叉（环岛入口）后强制拐多久；以及之后多久不再重新认分叉。
-   不设时限的话车进了环岛会一直"认分叉"，绕不出来。 */
+/* 识别到分叉（环岛入口/方框角）后强制拐多久。
+   之后必须重新看到"干净单线"才会再次允许触发——用固定时间冷却的话，
+   方框环岛这种连续三个角、间隔不到 2 s 的情况，后两个角会被锁死过不去。 */
 #define BRANCH_HOLD_TICKS       30U      /* 30 × 10 ms = 300 ms */
-#define BRANCH_COOL_TICKS       200U     /* 2 s */
+/* 压线 <= 3 路算"干净单线"；连续这么多拍才重新允许认分叉 */
+#define LINE_CLEAN_MAX_COUNT    3U
+#define LINE_CLEAN_REARM_TICKS  10U      /* 100 ms */
 #define SPEED_KP_CCR            300.0f
 #define SPEED_KI_CCR            6000.0f
 /* 积分项的**输出**上限（CCR）。积分只补前馈残差，不需要很大，也避免绕圈。 */
 #define SPEED_I_OUT_LIMIT       400.0f
 
 /* ---------------- 安全 ---------------- */
-#define LINE_LOST_STOP_MS       300U     /* 丢线超过此时间就停机 */
+#define LINE_LOST_STOP_MS       500U     /* 丢线超过此时间才停机 */
 #define LINE_LOST_STOP_TICKS    (LINE_LOST_STOP_MS / CTRL_PERIOD_MS)
 /* 丢线搜索期间把基本车速降到这个比例：原地转比往前冲更容易把线扫回来 */
 #define LINE_SEARCH_SPEED_SCALE 0.35f
@@ -309,7 +312,8 @@ static float speed_i_l, speed_i_r;  /* 每轮速度环积分（直接是 CCR 输
 static float spd_ramp;         /* 目标速度斜坡状态 */
 static float dir_l_state = 1.0f, dir_r_state = 1.0f;  /* 每轮当前驱动方向，带迟滞 */
 static uint16_t branch_ticks;  /* 分叉强制转向剩余拍数 */
-static uint16_t branch_cool;   /* 分叉冷却剩余拍数 */
+static uint8_t  branch_armed = 1U;  /* 1 = 允许识别分叉；看到干净单线后重新置 1 */
+static uint16_t clean_ticks;   /* 连续看到"干净单线"的拍数 */
 static volatile float dbg_turn_mps;
 static volatile float dbg_err;
 static volatile int16_t dbg_ccr_l, dbg_ccr_r;
@@ -527,7 +531,8 @@ static void RunButton_Update(void)
       dir_l_state = 1.0f;
       dir_r_state = 1.0f;
       branch_ticks = 0U;
-      branch_cool = 0U;
+      branch_armed = 1U;
+      clean_ticks = 0U;
       dbg_turn_mps = 0.0f;
       dbg_err = 0.0f;
       TIM1->CCR1 = 0U;
@@ -560,7 +565,8 @@ static void Control_Update(void)
     dir_l_state = 1.0f;
     dir_r_state = 1.0f;
     branch_ticks = 0U;
-    branch_cool = 0U;
+    branch_armed = 1U;
+    clean_ticks = 0U;
     dbg_turn_mps = 0.0f;
     dbg_err = 0.0f;
     TIM1->CCR1 = 0U;
@@ -570,9 +576,8 @@ static void Control_Update(void)
 
   if (run_ticks < 0xFFFFU) ++run_ticks;
 
-  /* 分叉强制转向 / 冷却计时 */
+  /* 分叉强制转向计时 */
   if (branch_ticks > 0U) --branch_ticks;
-  if (branch_cool > 0U) --branch_cool;
 
   /* ---------- 偏差 ---------- */
   if (line_valid == 0U)
@@ -602,23 +607,32 @@ static void Control_Update(void)
   else
   {
     int16_t e_milli = line_error_milli;
-    uint8_t wide = (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT) ? 1U : 0U;
+    uint16_t n_active = Line_ActiveCount(line_bits);
+    uint8_t wide = (n_active >= LINE_WIDE_ACTIVE_COUNT) ? 1U : 0U;
+
+    /* 连续看到"干净单线"才重新允许认分叉。
+       这样方框环岛三个角、每个角之间都有一段正常单线，就都能触发；
+       而卡在路口/分叉里时不会反复触发。 */
+    if ((wide == 0U) && (n_active <= LINE_CLEAN_MAX_COUNT))
+    {
+      if (clean_ticks < 0xFFFFU) ++clean_ticks;
+      if (clean_ticks >= LINE_CLEAN_REARM_TICKS) branch_armed = 1U;
+    }
+    else
+    {
+      clean_ticks = 0U;
+    }
 
     if (wide)
     {
       int16_t we;
       uint8_t is_branch = Line_WideError(&we);
 
-      if (is_branch)
+      if (is_branch && (branch_armed != 0U) && (branch_ticks == 0U))
       {
-        /* 看到"主线 + 支线"同时压着 = 分叉/环岛入口。
-           只在冷却结束后触发一次短促的强制转向；否则车进了环岛会一直
-           认分叉，绕着不出来。 */
-        if ((branch_ticks == 0U) && (branch_cool == 0U))
-        {
-          branch_ticks = BRANCH_HOLD_TICKS;
-          branch_cool = BRANCH_COOL_TICKS;
-        }
+        branch_ticks = BRANCH_HOLD_TICKS;
+        branch_armed = 0U;
+        clean_ticks = 0U;
       }
       if (branch_ticks > 0U) e_milli = we;
     }
