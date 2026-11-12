@@ -161,6 +161,34 @@
 #define TUNE_RX_BUF             64U
 #define TUNE_LINE_IDLE_MS       120U
 #define TUNE_PRINT_MS           100U
+
+/* ==========================================================================
+   任务二：原地旋转，走 4 个 90°（90 -> 180 -> 270 -> 360），每个角度停约 1 s
+   --------------------------------------------------------------------------
+   这一项必须用陀螺仪：把 Z 轴角速度对时间积分得到累计转角，
+   转到离目标差 ROT_STOP_AHEAD_DEG 度时断电，靠惯性滑到位。
+   积分取**绝对值**，这样陀螺仪正装反装都能用，不用现场试符号。
+   ========================================================================== */
+#define TASK_LINE               1U
+#define TASK_ROTATE             2U
+/* 上电默认跑哪个任务：串口发 m=1 / m=2 可以在线切回来 */
+#define TASK_SELECT             TASK_ROTATE
+
+#define ROT_STEP_DEG            90.0f    /* 每一步转多少度 */
+#define ROT_STEPS               4U       /* 一共几步（4 × 90 = 一圈） */
+#define ROT_HOLD_MS             1000U    /* 每个角度停多久 */
+#define ROT_PIVOT_MPS           0.22f    /* 原地转时两轮的反向速度（差速） */
+#define ROT_STOP_AHEAD_DEG      12.0f    /* 提前多少度断电，靠惯性滑到位 */
+#define ROT_TIMEOUT_MS          5000U    /* 单步超时保护，防止卡死 */
+#define ROT_DIR_DEFAULT         1.0f     /* 1 = 顺时针（左轮前进 / 右轮后退），-1 = 逆时针 */
+#define GYRO_DEADBAND_DPS       1.2f     /* 小于这个角速度当噪声丢掉，免得积分漂 */
+#define GYRO_BIAS_SETTLE_MS     800U     /* 上电后等这么久再开始采零偏 */
+#define GYRO_BIAS_MIN_SAMPLES   100U
+
+#define ROT_STATE_IDLE          0U
+#define ROT_STATE_TURN          1U
+#define ROT_STATE_HOLD          2U
+#define ROT_STATE_DONE          3U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -275,6 +303,9 @@ static void DwtCyccnt_Init(void);
 static void Control_Update(void);
 static void RunButton_Update(void);
 static void Tune_Service(uint32_t now);
+static void GyroBias_Update(float raw);
+static void GyroBias_Latch(void);
+static void GyroBias_Reset(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -341,6 +372,26 @@ static char tune_rx[TUNE_RX_BUF];
 static uint8_t tune_rx_len;
 static uint32_t tune_last_byte_tick;
 static uint8_t tune_enabled = 1U;
+
+/* ---- 任务二：原地旋转 ---- */
+static uint8_t  task_mode   = TASK_SELECT;
+static volatile float tune_rot_dir   = ROT_DIR_DEFAULT;
+static volatile float tune_rot_speed = ROT_PIVOT_MPS;
+static volatile float tune_rot_ahead = ROT_STOP_AHEAD_DEG;
+
+static volatile uint8_t  rot_state;         /* ROT_STATE_* */
+static volatile uint8_t  rot_step;          /* 当前第几步（1..ROT_STEPS） */
+static volatile float    rot_yaw_deg;       /* 累计转角（绝对值），度 */
+static volatile float    rot_target_deg;    /* 本步目标角度，度 */
+static uint32_t rot_tick;
+
+static volatile float    gyro_gz;           /* 已扣零偏的 Z 轴角速度，dps */
+static volatile uint32_t gyro_tick;
+static float    gyro_bias;                  /* 锁存的零偏，dps */
+static float    gyro_bias_sum;
+static uint16_t gyro_bias_cnt;
+static uint32_t gyro_bias_tick;
+static uint8_t  gyro_bias_ok;
 
 /* ---- 小工具 ---- */
 static float Limit(float v, float lo, float hi)
@@ -518,7 +569,48 @@ static void Encoder_UpdateSpeed(void)
             ((float)(ENC_AVG_SAMPLES * CTRL_PERIOD_MS) / 1000.0f);
 }
 
-/* 发车键：PB14 低电平按下，每按一次在"待发车 / 运行中"之间切换。 */
+/* 上电后整车静止，累积 Z 轴角速度求均值作为零偏。
+   开始旋转的瞬间锁存，之后用 (原始值 - 零偏)。 */
+static void GyroBias_Update(float raw)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (gyro_bias_ok != 0U) return;
+
+  if (gyro_bias_tick == 0U) gyro_bias_tick = (now != 0U) ? now : 1U;
+  if ((now - gyro_bias_tick) < GYRO_BIAS_SETTLE_MS) return;
+
+  gyro_bias_sum += raw;
+  if (gyro_bias_cnt < 0xFFFFU) ++gyro_bias_cnt;
+}
+
+static void GyroBias_Latch(void)
+{
+  if (gyro_bias_cnt > 0U)
+  {
+    gyro_bias = gyro_bias_sum / (float)gyro_bias_cnt;
+  }
+  else
+  {
+    gyro_bias = 0.0f;
+  }
+  gyro_bias_ok = 1U;
+  printf("gyro,bias,%ld,%u\r\n", (long)(gyro_bias * 100.0f), (unsigned)gyro_bias_cnt);
+}
+
+static void GyroBias_Reset(void)
+{
+  gyro_bias_ok = 0U;
+  gyro_bias = 0.0f;
+  gyro_bias_sum = 0.0f;
+  gyro_bias_cnt = 0U;
+  gyro_bias_tick = HAL_GetTick();
+  gyro_gz = 0.0f;
+}
+
+/* 发车键：PB14 低电平按下。
+   任务一：每按一次在"待发车 / 运行中"之间切换；
+   任务二：按一次开始走 4×90°，再按一次中途放弃。 */
 static void RunButton_Update(void)
 {
   static uint8_t stable = 1U;
@@ -537,25 +629,59 @@ static void RunButton_Update(void)
     stable = candidate;
     if (stable == 0U) /* 按下 */
     {
-      run_on = (run_on != 0U) ? 0U : 1U;
-      fault_code = 0U;
-      run_ticks = 0U;
-      lost_ticks = 0U;
-      stall_ticks = 0U;
-      line_prev_err = 0.0f;
-      line_d_lpf = 0.0f;
-      speed_i_l = 0.0f;
-      speed_i_r = 0.0f;
-      spd_ramp = 0.0f;
-      dir_l_state = 1.0f;
-      dir_r_state = 1.0f;
-      branch_ticks = 0U;
-      branch_armed = 1U;
-      clean_ticks = 0U;
-      dbg_turn_mps = 0.0f;
-      dbg_err = 0.0f;
-      TIM1->CCR1 = 0U;
-      TIM1->CCR2 = 0U;
+      if (task_mode == TASK_ROTATE)
+      {
+        if ((rot_state == ROT_STATE_IDLE) || (rot_state == ROT_STATE_DONE))
+        {
+          /* 开始一轮 4×90°：先锁存零偏，累计角清零 */
+          GyroBias_Latch();
+          rot_yaw_deg = 0.0f;
+          rot_step = 1U;
+          rot_target_deg = ROT_STEP_DEG;
+          rot_state = ROT_STATE_TURN;
+          rot_tick = now;
+          run_on = 1U;
+          fault_code = 0U;
+          run_ticks = 0U;
+          speed_i_l = 0.0f;
+          speed_i_r = 0.0f;
+          spd_ramp = 0.0f;
+          dir_l_state = 1.0f;
+          dir_r_state = 1.0f;
+          printf("rot,start\r\n");
+        }
+        else
+        {
+          rot_state = ROT_STATE_IDLE;
+          run_on = 0U;
+          GyroBias_Reset();
+          TIM1->CCR1 = 0U;
+          TIM1->CCR2 = 0U;
+          printf("rot,abort\r\n");
+        }
+      }
+      else
+      {
+        run_on = (run_on != 0U) ? 0U : 1U;
+        fault_code = 0U;
+        run_ticks = 0U;
+        lost_ticks = 0U;
+        stall_ticks = 0U;
+        line_prev_err = 0.0f;
+        line_d_lpf = 0.0f;
+        speed_i_l = 0.0f;
+        speed_i_r = 0.0f;
+        spd_ramp = 0.0f;
+        dir_l_state = 1.0f;
+        dir_r_state = 1.0f;
+        branch_ticks = 0U;
+        branch_armed = 1U;
+        clean_ticks = 0U;
+        dbg_turn_mps = 0.0f;
+        dbg_err = 0.0f;
+        TIM1->CCR1 = 0U;
+        TIM1->CCR2 = 0U;
+      }
     }
   }
 }
@@ -595,6 +721,55 @@ static void Control_Update(void)
   }
 
   if (run_ticks < 0xFFFFU) ++run_ticks;
+
+  /* ================= 任务二：原地旋转，不用光电管 ================= */
+  if (task_mode == TASK_ROTATE)
+  {
+    uint32_t now = HAL_GetTick();
+
+    v_target = 0.0f;                 /* 原地转：基本车速为 0，只给差速 */
+    switch (rot_state)
+    {
+      case ROT_STATE_TURN:
+        if (((rot_target_deg - rot_yaw_deg) <= tune_rot_ahead) ||
+            ((now - rot_tick) > ROT_TIMEOUT_MS))
+        {
+          rot_state = ROT_STATE_HOLD;
+          rot_tick = now;
+          turn = 0.0f;
+        }
+        else
+        {
+          turn = tune_rot_dir * tune_rot_speed;
+        }
+        break;
+
+      case ROT_STATE_HOLD:
+        turn = 0.0f;
+        if ((now - rot_tick) >= ROT_HOLD_MS)
+        {
+          if (rot_step >= ROT_STEPS)
+          {
+            rot_state = ROT_STATE_DONE;
+            run_on = 0U;
+          }
+          else
+          {
+            ++rot_step;
+            rot_target_deg = (float)rot_step * ROT_STEP_DEG;
+            rot_state = ROT_STATE_TURN;
+            rot_tick = now;
+          }
+        }
+        break;
+
+      default:
+        turn = 0.0f;
+        break;
+    }
+    dbg_turn_mps = turn;
+    goto speed_loop;
+  }
 
   /* 分叉强制转向计时 */
   if (branch_ticks > 0U) --branch_ticks;
@@ -697,6 +872,7 @@ static void Control_Update(void)
 
   v_target = spd_ramp * search_scale;
 
+speed_loop:
   /* turn > 0 表示右转：左轮加速、右轮减速（可以减到反转为负） */
   t_l = Limit(v_target + turn, -tune_inner_rev, SPEED_LIMIT_MPS);
   t_r = Limit(v_target - turn, -tune_inner_rev, SPEED_LIMIT_MPS);
@@ -835,6 +1011,24 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='p')) tune_ccr_per_mp  = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='x')) tune_ccr_max     = v;
   else if ((len == 2U) && (nm[0]=='h') && (nm[1]=='c')) tune_hold_ccr    = v;
+  else if ((len == 2U) && (nm[0]=='s') && (nm[1]=='a')) tune_rot_ahead   = v;
+  else if ((len == 2U) && (nm[0]=='r') && (nm[1]=='p')) tune_rot_speed   = v;
+  else if ((len == 2U) && (nm[0]=='r') && (nm[1]=='d')) tune_rot_dir     = (v < 0.0f) ? -1.0f : 1.0f;
+  else if ((len == 1U) && (nm[0]=='m'))
+  {
+    uint8_t m = (v < 1.5f) ? TASK_LINE : TASK_ROTATE;
+
+    if (m != task_mode)
+    {
+      task_mode = m;
+      run_on = 0U;
+      rot_state = ROT_STATE_IDLE;
+      TIM1->CCR1 = 0U;
+      TIM1->CCR2 = 0U;
+      if (m == TASK_ROTATE) GyroBias_Reset();
+      printf("mode,%u\r\n", (unsigned)m);
+    }
+  }
   else if ((len == 1U) && (nm[0]=='l')) tune_line_sign = (v < 0.0f) ? -1.0f : 1.0f;
   else { printf("err,name\r\n"); return; }
 
@@ -850,6 +1044,8 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   tune_ccr_per_mp = Limit(tune_ccr_per_mp, 0.0f, 20000.0f);
   tune_ccr_max   = Limit(tune_ccr_max, 0.0f, 7199.0f);
   tune_hold_ccr  = Limit(tune_hold_ccr, 0.0f, 7199.0f);
+  tune_rot_ahead = Limit(tune_rot_ahead, 0.0f, 45.0f);
+  tune_rot_speed = Limit(tune_rot_speed, 0.05f, 0.60f);
 
   printf("set,%s,%ld\r\n", nm, (long)(v * 1000.0f));
 }
@@ -868,6 +1064,12 @@ static void Tune_Print(void)
          (long)tune_ccr_per_mp,
          (long)tune_ccr_max,
          (long)tune_hold_ccr,
+         (long)tune_line_sign);
+  printf("cfg2,m=%u,rd=%ld,rp=%ld,sa=%ld,l=%ld\r\n",
+         (unsigned)task_mode,
+         (long)tune_rot_dir,
+         (long)(tune_rot_speed * 1000.0f),
+         (long)(tune_rot_ahead * 10.0f),
          (long)tune_line_sign);
 }
 
@@ -968,6 +1170,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   divider = 0U;
 
   Encoder_UpdateSpeed();
+
+  /* 任务二：把 Z 轴角速度积分成累计转角。
+     取绝对值是为了不用管陀螺仪正装反装——车只朝一个方向转，
+     累计量的绝对值就是转过的角度。 */
+  if ((task_mode == TASK_ROTATE) &&
+      ((rot_state == ROT_STATE_TURN) || (rot_state == ROT_STATE_HOLD)))
+  {
+    float g = gyro_gz;
+
+    if (g > GYRO_DEADBAND_DPS)       rot_yaw_deg += g * CTRL_DT;
+    else if (g < -GYRO_DEADBAND_DPS) rot_yaw_deg -= g * CTRL_DT;
+  }
+
   Control_Update();
 }
 
@@ -1038,6 +1253,11 @@ int main(void)
   /* 光电管读取依赖 DWT 计时，必须最先打开 */
   DwtCyccnt_Init();
 
+  /* 陀螺仪（任务二靠它积分转角）。上电后请让车静止约 1 s 以采零偏。 */
+  dodo_BMI270_init();
+  gyro_tick = HAL_GetTick();
+  GyroBias_Reset();
+
   /* 1 kHz 时基：控制周期由 HAL_TIM_PeriodElapsedCallback 分频到 10 ms */
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) Error_Handler();
 
@@ -1050,7 +1270,7 @@ int main(void)
   HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
   HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
 
-  printf("ready,line_follow\r\n");
+  printf("ready,%s\r\n", (task_mode == TASK_ROTATE) ? "rotate_4x90" : "line_follow");
   Tune_Print();
   /* USER CODE END 2 */
 
@@ -1060,7 +1280,40 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
-    /* 光电管与发车键 */
+    /* 陀螺仪：dodo_BMI270_get_data() 会更新原始数据 */
+    dodo_BMI270_get_data();
+    {
+      float raw_gz = BMI270_gyro_transition(BMI270_gyro_z);
+
+      if (gyro_bias_ok == 0U) GyroBias_Update(raw_gz);
+      gyro_gz = raw_gz - gyro_bias;
+      gyro_tick = now;
+    }
+
+    if (task_mode == TASK_ROTATE)
+    {
+      /* 任务二不用光电管，跳过读取。状态跳变在主循环里打印，
+         不在 10 ms 中断里 printf（会阻塞串口）。 */
+      static uint8_t last_state = 0xFFU;
+
+      if (rot_state != last_state)
+      {
+        last_state = rot_state;
+        if (rot_state == ROT_STATE_HOLD)
+        {
+          printf("rot,hold,%u,%ld\r\n", (unsigned)rot_step, (long)(rot_yaw_deg * 10.0f));
+        }
+        else if (rot_state == ROT_STATE_DONE)
+        {
+          printf("rot,done,%ld\r\n", (long)(rot_yaw_deg * 10.0f));
+        }
+        else if (rot_state == ROT_STATE_TURN)
+        {
+          printf("rot,turn,%u,%ld\r\n", (unsigned)rot_step, (long)(rot_target_deg * 10.0f));
+        }
+      }
+    }
+    else
     {
       static uint32_t line_tick;
       if ((now - line_tick) >= LINE_SAMPLE_MS)
@@ -1069,6 +1322,7 @@ int main(void)
         LineSensor_Update();
       }
     }
+
     RunButton_Update();
     Tune_Service(now);
 
@@ -1078,18 +1332,34 @@ int main(void)
       if ((now - print_tick) >= TUNE_PRINT_MS)
       {
         print_tick = now;
-        printf("st,%u,%u,%u,%04X,%d,%ld,%ld,%ld,%ld,%d,%d\r\n",
-               (unsigned int)run_on,
-               (unsigned int)line_valid,
-               (unsigned int)fault_code,
-               (unsigned int)line_bits,
-               (int)line_error_milli,               /* 偏差，千分之一权重 */
-               (long)(dbg_err * 1000.0f),           /* 参与控制的偏差 ×1000 */
-               (long)(dbg_turn_mps * 1000.0f),      /* 转向量 mm/s，正 = 右转 */
-               (long)(speed_l * 1000.0f),           /* 左轮实测 mm/s */
-               (long)(speed_r * 1000.0f),           /* 右轮实测 mm/s */
-               (int)dbg_ccr_l,
-               (int)dbg_ccr_r);
+
+        if (task_mode == TASK_ROTATE)
+        {
+          /* rot,状态,步数,累计角×10,角速度×10,目标角×10,ccrL,ccrR */
+          printf("rot,%u,%u,%ld,%ld,%ld,%d,%d\r\n",
+                 (unsigned int)rot_state,
+                 (unsigned int)rot_step,
+                 (long)(rot_yaw_deg * 10.0f),
+                 (long)(gyro_gz * 10.0f),
+                 (long)(rot_target_deg * 10.0f),
+                 (int)dbg_ccr_l,
+                 (int)dbg_ccr_r);
+        }
+        else
+        {
+          printf("st,%u,%u,%u,%04X,%d,%ld,%ld,%ld,%ld,%d,%d\r\n",
+                 (unsigned int)run_on,
+                 (unsigned int)line_valid,
+                 (unsigned int)fault_code,
+                 (unsigned int)line_bits,
+                 (int)line_error_milli,               /* 偏差，千分之一权重 */
+                 (long)(dbg_err * 1000.0f),           /* 参与控制的偏差 ×1000 */
+                 (long)(dbg_turn_mps * 1000.0f),      /* 转向量 mm/s，正 = 右转 */
+                 (long)(speed_l * 1000.0f),           /* 左轮实测 mm/s */
+                 (long)(speed_r * 1000.0f),           /* 右轮实测 mm/s */
+                 (int)dbg_ccr_l,
+                 (int)dbg_ccr_r);
+        }
       }
     }
     /* USER CODE END WHILE */
