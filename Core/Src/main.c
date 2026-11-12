@@ -131,6 +131,15 @@
 /* 短暂丢线时保持最后一次偏差继续盲开的时间，超时仍无信号才停机。 */
 #define LINE_LOST_HOLD_MS          300U
 #define LINE_LOST_HOLD_TICKS       (LINE_LOST_HOLD_MS / CONTROL_UPDATE_MS)
+/* 丢线期间保持的偏差按此系数逐周期衰减（指数衰减，每 10 ms 乘一次）。
+   0.93 时：100 ms 后剩 48%，200 ms 剩 23%，300 ms 只剩 11%。
+   这样做的好处是两头都对：
+     - 十字路口那种 50~100 ms 的短暂丢线，转向量基本保留，能直穿过去；
+     - 冲出弯道后的长丢线，转向量迅速衰减到接近 0，车会自己摆正去重新找线，
+       而不是像固定保持那样「以满舵转 300 ms」把车甩到赛道外面。
+   实测日志里丢线后 target 一直是 300、diff 0.70，紧接着就彻底丢线并停机，
+   正是这个固定保持造成的。 */
+#define LINE_LOST_DECAY            0.93f
 
 /* 发车后目标速度的爬升率，避免目标速度阶跃造成打滑和电流冲击。 */
 #define CONTROL_ACCEL_LIMIT_MPS2   1.0f
@@ -1404,8 +1413,9 @@ static void VehicleControl_Update(void)
         return;
       }
 
-      /* 保持期间偏差不变，微分必须置 0，否则误差会持续累积 */
-      line_error = line_state.previous_error;
+      /* 保持期间偏差按指数衰减：短暂丢线仍能维持转向，长丢线则迅速摆正。
+         微分必须置 0，否则误差会持续累积。 */
+      line_error = line_state.previous_error * LINE_LOST_DECAY;
       line_derivative = 0.0f;
     }
     else
