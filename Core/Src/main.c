@@ -247,6 +247,31 @@ static volatile uint16_t fault_ccr_r;
    但速度环追不满指令差速（右轮目标接近 0.85 m/s 时实测只有 0.74），
    所以取 0.0025 略高于理论值，用一点超前来抵消执行机构的滞后。 */
 #define YAW_DIFF_FF_MPS_PER_DPS    0.0025f
+/* ---------------- 直角弯（陀螺仪角度闭环） ----------------
+   直角弯的死穴：车头刚转过 90°，新的赛道还没进入光电管的视野，
+   此时 P 项没有任何依据，车只能靠惯性冲出去。
+   解决办法是不靠光电管，直接用陀螺仪积分出来的航向角闭环转过固定角度。 */
+/* 目标转角（度）。85~90 之间；设 0 可整体关闭该功能。 */
+#define CORNER_TURN_DEG            88.0f
+/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 3 路，
+   即"最外侧的两三路压线、内侧全脱"——这是直角弯的典型特征。
+   4500 对应重心落在最外侧两路之间。 */
+#define CORNER_DETECT_ERR          4500
+#define CORNER_DETECT_MAX_ACTIVE   3U
+/* 连续满足多少个控制周期才认账，避免单帧误触发。 */
+#define CORNER_DETECT_TICKS        2U
+/* 角度到位判据（度）与超时保护。 */
+#define CORNER_EXIT_DEG            6.0f
+#define CORNER_EXIT_LINE_ERR       2000
+#define CORNER_TIMEOUT_MS          1500U
+#define CORNER_TIMEOUT_TICKS       (CORNER_TIMEOUT_MS / CONTROL_UPDATE_MS)
+/* 角度环 P 增益（dps 每度）。90° 偏差时给 720 dps，会被限幅到 300，
+   接近目标时自然减速；配合内层角速度环属于串级，不会有明显超调。 */
+#define CORNER_ANGLE_KP            8.0f
+/* 退出后冷却时间，防止刚上线又被同一个弯重复触发。 */
+#define CORNER_COOLDOWN_MS         400U
+#define CORNER_COOLDOWN_TICKS      (CORNER_COOLDOWN_MS / CONTROL_UPDATE_MS)
+
 /* 单次差速偏置上限，防止饱和打转。
    允许内轮反转后差速可以做到 0.70：spd=0.45、差速 0.61 时
    内轮 -0.16、外轮 0.88，角速度约 320 dps、半径约 0.06 m。 */
@@ -479,6 +504,18 @@ static uint8_t YawTest_Active(void)
 static volatile float tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
 /* 差速指令的斜坡状态（跨周期保留，见 VehicleControl_Update）。 */
 static float yaw_diff_slewed;
+/* 陀螺仪积分出来的航向角（度，正 = 左转）。直角弯状态机用它做绝对角度闭环。 */
+static volatile float control_yaw_angle;
+static volatile float tune_corner_deg = CORNER_TURN_DEG;
+static uint8_t  corner_state;            /* 0 = 循迹，1 = 直角弯转角中 */
+static float    corner_target_angle;
+static uint16_t corner_ticks;
+static uint16_t corner_detect_ticks;
+static uint16_t corner_cooldown_ticks;
+/* 直角弯事件由中断里登记、主循环里打印：printf 是阻塞 UART，
+   在 10 ms 控制中断里直接打印会拖垮控制周期。 */
+static volatile uint8_t corner_event;        /* 0 无 / 1 进入 / 2 退出 */
+static volatile float   corner_event_angle;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -732,7 +769,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -799,6 +836,15 @@ static void Tune_ApplyParameter(uint8_t index, float value)
         tune_inner_reverse_mps = 0.35f;
       else
         tune_inner_reverse_mps = value;
+      break;
+    case 20U: /* 直角弯目标转角（度）：c90=88 正常，c90=0 关闭该功能 */
+      if (value < 0.0f)
+        tune_corner_deg = 0.0f;
+      else if (value > 120.0f)
+        tune_corner_deg = 120.0f;
+      else
+        tune_corner_deg = value;
+      corner_detect_ticks = 0U;
       break;
     default: return;
   }
@@ -925,6 +971,7 @@ static void Tune_SetDefaults(void)
   /* 阶跃测试不属于标定参数，恢复默认时一并退出，避免发车后车莫名画圈。 */
   tune_yaw_test_dps = 0.0f;
   tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
+  tune_corner_deg = CORNER_TURN_DEG;
   tune_stall_enable = 1U;
 }
 
@@ -1058,8 +1105,9 @@ static void Tune_PrintAll(void)
          (long)(tune_yaw_ff * 1000000.0f),
          (long)tune_line_sign,
          (unsigned int)line_polarity_inverted);
-  printf("cfg2,yt=%ld,rev=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
-         (long)(tune_inner_reverse_mps * 1000.0f));
+  printf("cfg2,yt=%ld,rev=%ld,c90=%ld\r\n", (long)(tune_yaw_test_dps * 1000.0f),
+         (long)(tune_inner_reverse_mps * 1000.0f),
+         (long)(tune_corner_deg * 10.0f));
 }
 
 /* 比较 line 的前 len 个字符是否恰好等于 name */
@@ -1151,7 +1199,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 19U; ++k)
+  for (k = 0U; k < 20U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1280,6 +1328,12 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   control_measured_yaw_rate_dps = 0.0f;
   control_yaw_diff_mps = 0.0f;
   yaw_diff_slewed = 0.0f;
+  /* 停车/复位时把航向角、直角弯状态机全部归零，下次发车从 0 度重新计。 */
+  control_yaw_angle = 0.0f;
+  corner_state = 0U;
+  corner_ticks = 0U;
+  corner_detect_ticks = 0U;
+  corner_cooldown_ticks = 0U;
   control_turn_pwm = 0.0f;
   control_base_pwm = 0.0f;
   control_speed_target_mps = 0.0f;
@@ -1302,6 +1356,25 @@ static float Control_Clamp(float value, float minimum, float maximum)
   if (value > maximum)
     return maximum;
   return value;
+}
+
+/* 按当前极性统计"压线"的路数，供直角弯检测使用。 */
+static uint16_t Line_ActiveCount(void)
+{
+  uint16_t bits = line_sensor_bits;
+  uint8_t level = LINE_SENSOR_ACTIVE_LEVEL;
+  uint16_t count = 0U;
+  uint16_t channel;
+
+  if (line_polarity_inverted != 0U)
+    level = (level == 0U) ? 1U : 0U;
+
+  for (channel = 0U; channel < MULTIPLEXER_CHANNEL_NUM; ++channel)
+  {
+    if (MUX_GET_CHANNEL(bits, channel) == level)
+      ++count;
+  }
+  return count;
 }
 
 /* 循迹误差非线性塑形：output = err * |err| / SHAPE。
@@ -1406,8 +1479,47 @@ static void VehicleControl_Update(void)
 
   if ((tune_yaw_test_dps > -1.0f) && (tune_yaw_test_dps < 1.0f))
   {
-    if (line_sensor_valid == 0U)
+    if (corner_state != 0U)
     {
+      /* ---------- 直角弯：光电管已经没有新赛道的信息，改用航向角闭环 ----------
+         目标角速度 = 角度环 P × （目标角 − 当前角），外层角度环 + 内层角速度环，
+         两环都是我们已经标定好的，所以车头能准确转过设定角度。 */
+      float angle_error = corner_target_angle - control_yaw_angle;
+
+      line_error = 0.0f;
+      line_derivative = 0.0f;
+      line_state.previous_error = 0.0f;
+      line_state.initialized = 0U;
+      line_lost_ticks = 0U;
+      control_target_yaw_rate_dps = Control_Clamp(CORNER_ANGLE_KP * angle_error,
+                                                  -CONTROL_MAX_YAW_RATE_DPS,
+                                                  CONTROL_MAX_YAW_RATE_DPS);
+
+      if (corner_ticks < 0xFFFFU)
+        ++corner_ticks;
+
+      /* 三种退出：角度到位 / 重新压到线且偏差不大 / 超时保护 */
+      if (((angle_error < CORNER_EXIT_DEG) && (angle_error > -CORNER_EXIT_DEG)) ||
+          ((line_sensor_valid != 0U) &&
+           (line_error_milli < CORNER_EXIT_LINE_ERR) &&
+           (line_error_milli > -CORNER_EXIT_LINE_ERR)) ||
+          (corner_ticks >= CORNER_TIMEOUT_TICKS))
+      {
+        corner_state = 0U;
+        corner_cooldown_ticks = CORNER_COOLDOWN_TICKS;
+        line_state.initialized = 0U;
+        line_state.previous_error = 0.0f;
+        corner_event = 2U;
+        corner_event_angle = control_yaw_angle;
+      }
+    }
+    else
+    {
+      if (corner_cooldown_ticks > 0U)
+        --corner_cooldown_ticks;
+
+      if (line_sensor_valid == 0U)
+      {
       /* 十字路口、虚线或飞线造成的短暂丢线：保持最后一次偏差继续盲开，
          角速度环仍由陀螺仪闭环以维持航向；超时仍无信号才停机。 */
       if (line_lost_ticks < LINE_LOST_HOLD_TICKS)
@@ -1451,8 +1563,38 @@ static void VehicleControl_Update(void)
     control_target_yaw_rate_dps = Control_Clamp(
         (tune_line_kp * Control_ShapeLineError(line_error)) + (tune_line_kd * line_derivative),
         -CONTROL_MAX_YAW_RATE_DPS, CONTROL_MAX_YAW_RATE_DPS);
-    line_state.previous_error = line_error;
-    line_state.initialized = 1U;
+      line_state.previous_error = line_error;
+      line_state.initialized = 1U;
+
+      /* 直角弯检测：线跑到最外侧（偏差绝对值很大）且只剩少数几路压线，
+         说明车身已经把线甩到传感器边缘，再往前走光电管就看不到新赛道了。
+         此时记录当前航向角，转入角度闭环强行转过设定角度。 */
+      if ((tune_corner_deg > 1.0f) && (corner_cooldown_ticks == 0U) &&
+          (line_sensor_valid != 0U) &&
+          ((line_error_milli >= CORNER_DETECT_ERR) ||
+           (line_error_milli <= -CORNER_DETECT_ERR)) &&
+          (Line_ActiveCount() <= CORNER_DETECT_MAX_ACTIVE))
+      {
+        if (corner_detect_ticks < CORNER_DETECT_TICKS)
+          ++corner_detect_ticks;
+      }
+      else
+      {
+        corner_detect_ticks = 0U;
+      }
+
+      if (corner_detect_ticks >= CORNER_DETECT_TICKS)
+      {
+        /* 偏差为负说明线在左侧，需要向左转；航向角正方向就是左转。 */
+        corner_target_angle = control_yaw_angle +
+            ((line_error_milli < 0) ? tune_corner_deg : -tune_corner_deg);
+        corner_state = 1U;
+        corner_ticks = 0U;
+        corner_detect_ticks = 0U;
+        corner_event = 1U;
+        corner_event_angle = control_yaw_angle;
+      }
+    }
   }
   else
   {
@@ -1471,6 +1613,8 @@ static void VehicleControl_Update(void)
   /* 目标角速度与扣除零偏后的 BMI270 Z 轴角速度之差由 PID 转为差速偏置。
      安装方向修正只作用在这里：调试打印的 gyro_z 始终是传感器原始方向。 */
   yaw_rate = tune_yaw_sign * gyro_z;
+  /* 直角弯用的航向角积分：用未滤波的角速度累加，避免低通带来的误差。 */
+  control_yaw_angle += yaw_rate * dt;
   /* 一阶低通抑制电机振动带来的高频噪声（只在控制环内使用）。 */
   yaw_rate_filtered = (yaw_rate_filter_alpha * yaw_rate_filtered) +
                       ((1.0f - yaw_rate_filter_alpha) * yaw_rate);
@@ -1858,6 +2002,15 @@ int main(void)
       }
     }
 
+    /* 直角弯事件：控制环只登记，打印放在主循环，避免阻塞 10 ms 控制中断。 */
+    if (corner_event != 0U)
+    {
+      uint8_t what = corner_event;
+      corner_event = 0U;
+      printf("corner,%s,%ld\r\n", (what == 1U) ? "start" : "done",
+             (long)(corner_event_angle * 10.0f));
+    }
+
     /* 故障由控制环置位并已停机，这里只负责报告一次；故障清除后可再次报告。 */
     {
       static uint8_t fault_reported;
@@ -1954,7 +2107,7 @@ int main(void)
           ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS))
       {
         control_print_tick = HAL_GetTick();
-        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u,%ld,%ld\r\n",
+        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u,%ld,%ld,%ld\r\n",
                (unsigned int)run_button_started,
                (unsigned int)line_sensor_valid,
                (unsigned int)imu_ready,
@@ -1964,7 +2117,8 @@ int main(void)
                (unsigned int)control_left_pwm,
                (unsigned int)control_right_pwm,
                (long)(control_measured_yaw_rate_dps * 1000.0f),
-               (long)(control_yaw_diff_mps * 1000.0f));
+               (long)(control_yaw_diff_mps * 1000.0f),
+               (long)(control_yaw_angle * 10.0f));
       }
     }
 #endif
