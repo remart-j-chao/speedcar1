@@ -82,10 +82,12 @@
 /* ---------------- 电机输出 ---------------- */
 /* TIM1 的 ARR 是 7199，占空比 = CCR / 7200。 */
 #define L_DIR_FORWARD           GPIO_PIN_RESET
+#define L_DIR_REVERSE           GPIO_PIN_SET
 #define R_DIR_FORWARD           GPIO_PIN_SET
+#define R_DIR_REVERSE           GPIO_PIN_RESET
 
 /* ---------------- 车速 ---------------- */
-#define SPEED_TARGET_MPS        0.40f    /* 基本速 */
+#define SPEED_TARGET_MPS        0.80f    /* 基本速 */
 #define SPEED_LIMIT_MPS         1.20f    /* 单轮目标速度上限 */
 #define SPEED_ACCEL_MPS2        1.5f     /* 起步加速度限制 */
 
@@ -96,9 +98,12 @@
 #define LINE_KP                 0.10f    /* (m/s) / 权重 */
 #define LINE_KD                 0.0025f  /* (m/s) / (权重/s) */
 #define LINE_D_LPF_ALPHA        0.8f     /* 偏差变化率低通，抑制量化跳变尖峰 */
-/* 转向（差速）上限，m/s。这是"急弯转得动转不动"的关键量： */
-/* 车身轮距约 0.186 m，角速度 = 2×差速/轮距，差速 0.45 m/s 约等于 4.8 rad/s。 */
-#define TURN_LIMIT_MPS          0.45f
+/* 转向（差速）上限，m/s。轮距约 0.186 m，角速度 = 2×差速/轮距。
+   0.60 配上内侧轮反转，急弯最小半径可以到 6 cm 左右。 */
+#define TURN_LIMIT_MPS          0.60f
+/* 允许内侧轮反转多少（m/s）。急弯只靠"内侧轮停转"不够，
+   必须让内侧轮倒转才能把车头硬拉过来。0 = 不允许反转。 */
+#define TURN_INNER_REVERSE_MPS  0.25f
 
 /* ---------------- 速度环（每轮独立 PI，直接以 CCR 为单位） ---------------- */
 /* TIM1 的 ARR 是 7199，占空比 = CCR / 7200。
@@ -261,6 +266,7 @@ static volatile float tune_line_kp   = LINE_KP;
 static volatile float tune_line_kd   = LINE_KD;
 static volatile float tune_line_sign = LINE_ERROR_SIGN;
 static volatile float tune_turn_lim  = TURN_LIMIT_MPS;
+static volatile float tune_inner_rev = TURN_INNER_REVERSE_MPS;
 static volatile float tune_target    = SPEED_TARGET_MPS;
 static volatile float tune_speed_kp  = SPEED_KP_CCR;
 static volatile float tune_speed_ki  = SPEED_KI_CCR;
@@ -335,6 +341,33 @@ static uint16_t Line_ActiveCount(uint16_t bits)
     if (MUX_GET_CHANNEL(bits, ch) == LINE_ACTIVE_LEVEL) ++n;
   }
   return n;
+}
+
+/* 压线过多时（十字、环岛入口、宽黑区）加权平均会被拉向中间，
+   直接用会"看见分叉却当没看见"。这里改用最左和最右压线通道的中点判方向：
+     - 对称的十字（最左和最右都在）-> 0，直行
+     - 一侧有分叉（环岛入口、岔路）-> 偏向那一侧，跟着拐进去
+   返回单位与 line_error_milli 一致（千分之一权重）。 */
+static int16_t Line_EdgeError(void)
+{
+  int16_t first = -1, last = -1;
+  uint16_t ch;
+
+  for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
+  {
+    if (MUX_GET_CHANNEL(line_bits, ch) == LINE_ACTIVE_LEVEL)
+    {
+      if (first < 0) first = (int16_t)ch;
+      last = (int16_t)ch;
+    }
+  }
+  if ((first < 0) || (last < 0)) return 0;
+
+  {
+    int32_t w_first = (first < 6) ? ((int32_t)first - 6L) : ((int32_t)first - 5L);
+    int32_t w_last  = (last  < 6) ? ((int32_t)last  - 6L) : ((int32_t)last  - 5L);
+    return (int16_t)(((w_first + w_last) * LINE_ERROR_SCALE) / 2L);
+  }
 }
 
 /* 读 12 路光电管，算出加权平均偏差。
@@ -488,17 +521,15 @@ static void Control_Update(void)
   }
   else
   {
-    err = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
-    deriv = (err - line_prev_err) / dt;
-    lost_ticks = 0U;
+    int16_t e_milli = line_error_milli;
+    uint8_t wide = (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT) ? 1U : 0U;
 
-    /* 十字 / 宽黑区：压线太多时加权平均会塌到 0，车会直冲。
-       此时沿用上一次的方向，等真正回到单线再恢复。 */
-    if (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT)
-    {
-      err = line_prev_err;
-      deriv = 0.0f;
-    }
+    if (wide) e_milli = Line_EdgeError();
+
+    err = tune_line_sign * ((float)e_milli / (float)LINE_ERROR_SCALE);
+    /* 宽黑区里偏差本来就会突变，D 项会给出吓人的反向脉冲，直接掐掉 */
+    deriv = wide ? 0.0f : ((err - line_prev_err) / dt);
+    lost_ticks = 0U;
     line_prev_err = err;
 
     /* 光电管是离散的，单步差分会有很大量化尖峰，这里再低通一次 */
@@ -526,64 +557,88 @@ static void Control_Update(void)
 
   v_target = spd_ramp;
 
-  /* turn > 0 表示右转：左轮加速、右轮减速 */
-  t_l = Limit(v_target + turn, 0.0f, SPEED_LIMIT_MPS);
-  t_r = Limit(v_target - turn, 0.0f, SPEED_LIMIT_MPS);
+  /* turn > 0 表示右转：左轮加速、右轮减速（可以减到反转为负） */
+  t_l = Limit(v_target + turn, -tune_inner_rev, SPEED_LIMIT_MPS);
+  t_r = Limit(v_target - turn, -tune_inner_rev, SPEED_LIMIT_MPS);
 
-  /* ---------- 速度环：每轮独立 PI，输出直接是 CCR ---------- */
+  /* ---------- 速度环：每轮独立 PI，输出 CCR + 方向 ---------- */
   {
-    float e_l = t_l - speed_l;
-    float e_r = t_r - speed_r;
-    float ff_l = tune_ccr_zero + (tune_ccr_per_mp * t_l);
-    float ff_r = tune_ccr_zero + (tune_ccr_per_mp * t_r);
+    float dir_l = (t_l < 0.0f) ? -1.0f : 1.0f;
+    float dir_r = (t_r < 0.0f) ? -1.0f : 1.0f;
+    float mag_t_l = AbsF(t_l);
+    float mag_t_r = AbsF(t_r);
+    /* 实测速度投影到"命令方向"上，反转时也是正的，PI 就能统一处理 */
+    float e_l = mag_t_l - (speed_l * dir_l);
+    float e_r = mag_t_r - (speed_r * dir_r);
 
-    speed_i_l = Limit(speed_i_l + (e_l * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
-    speed_i_r = Limit(speed_i_r + (e_r * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
-
-    ccr_l = ff_l + (tune_speed_kp * e_l) + (tune_speed_ki * speed_i_l);
-    ccr_r = ff_r + (tune_speed_kp * e_r) + (tune_speed_ki * speed_i_r);
-
-    /* 目标速度为 0 的那一轮必须真的停，不能因为前馈/积分还在推而空转 */
-    if (t_l <= 0.0f) { ccr_l = 0.0f; speed_i_l = 0.0f; }
-    if (t_r <= 0.0f) { ccr_r = 0.0f; speed_i_r = 0.0f; }
-
-    ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
-    ccr_r = Limit(ccr_r, 0.0f, tune_ccr_max);
-  }
-
-  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
-  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
-  TIM1->CCR1 = (uint16_t)ccr_l;
-  TIM1->CCR2 = (uint16_t)ccr_r;
-  dbg_ccr_l = (int16_t)ccr_l;
-  dbg_ccr_r = (int16_t)ccr_r;
-
-  /* ---------- 堵转 / 编码器方向反转保护 ---------- */
-  /* 两个轮子都只会被命令正转（DIR 脚固定），所以实测出现明显负速度
-     就说明编码器符号或方向脚接反了。这种情况会让速度环正反馈、越跑越快，
-     必须立刻停机，不能等它冲出去。 */
-  {
-    uint8_t bad_sign = 0U;
-
-    if ((ccr_l >= STALL_CCR_MIN) && (speed_l < -STALL_SPEED_MPS)) bad_sign = 1U;
-    if ((ccr_r >= STALL_CCR_MIN) && (speed_r < -STALL_SPEED_MPS)) bad_sign = 1U;
-
-    if ((run_ticks > RUN_GRACE_TICKS) &&
-        (bad_sign ||
-         (((ccr_l >= STALL_CCR_MIN) || (ccr_r >= STALL_CCR_MIN)) &&
-          (AbsF((speed_l + speed_r) * 0.5f) < STALL_SPEED_MPS))))
+    if (mag_t_l <= 0.0f)
     {
-      if (stall_ticks < 0xFFFFU) ++stall_ticks;
-      if (stall_ticks >= STALL_TICKS)
-      {
-        fault_code = 1U;
-        TIM1->CCR1 = 0U;
-        TIM1->CCR2 = 0U;
-      }
+      ccr_l = 0.0f;
+      speed_i_l = 0.0f;
     }
     else
     {
-      stall_ticks = 0U;
+      speed_i_l = Limit(speed_i_l + (e_l * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+      ccr_l = tune_ccr_zero + (tune_ccr_per_mp * mag_t_l) +
+              (tune_speed_kp * e_l) + (tune_speed_ki * speed_i_l);
+    }
+
+    if (mag_t_r <= 0.0f)
+    {
+      ccr_r = 0.0f;
+      speed_i_r = 0.0f;
+    }
+    else
+    {
+      speed_i_r = Limit(speed_i_r + (e_r * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+      ccr_r = tune_ccr_zero + (tune_ccr_per_mp * mag_t_r) +
+              (tune_speed_kp * e_r) + (tune_speed_ki * speed_i_r);
+    }
+
+    ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
+    ccr_r = Limit(ccr_r, 0.0f, tune_ccr_max);
+
+    HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin,
+                      (dir_l > 0.0f) ? L_DIR_FORWARD : L_DIR_REVERSE);
+    HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin,
+                      (dir_r > 0.0f) ? R_DIR_FORWARD : R_DIR_REVERSE);
+
+    TIM1->CCR1 = (uint16_t)ccr_l;
+    TIM1->CCR2 = (uint16_t)ccr_r;
+    dbg_ccr_l = (int16_t)ccr_l;
+    dbg_ccr_r = (int16_t)ccr_r;
+
+    /* ---------- 堵转 / 编码器方向反接保护 ---------- */
+    /* 命令正转却测到明显负速度（或反之），说明编码器符号或方向脚接反了。
+       这种情况速度环会正反馈、越跑越快，必须立刻停机。 */
+    {
+      float amax = AbsF(speed_l);
+      float atmp = AbsF(speed_r);
+      uint8_t bad_sign = 0U;
+
+      if (atmp > amax) amax = atmp;
+      if ((mag_t_l > 0.05f) && (ccr_l >= STALL_CCR_MIN) &&
+          ((speed_l * dir_l) < -STALL_SPEED_MPS)) bad_sign = 1U;
+      if ((mag_t_r > 0.05f) && (ccr_r >= STALL_CCR_MIN) &&
+          ((speed_r * dir_r) < -STALL_SPEED_MPS)) bad_sign = 1U;
+
+      if ((run_ticks > RUN_GRACE_TICKS) &&
+          (bad_sign ||
+           (((ccr_l >= STALL_CCR_MIN) || (ccr_r >= STALL_CCR_MIN)) &&
+            (amax < STALL_SPEED_MPS))))
+      {
+        if (stall_ticks < 0xFFFFU) ++stall_ticks;
+        if (stall_ticks >= STALL_TICKS)
+        {
+          fault_code = 1U;
+          TIM1->CCR1 = 0U;
+          TIM1->CCR2 = 0U;
+        }
+      }
+      else
+      {
+        stall_ticks = 0U;
+      }
     }
   }
 }
@@ -605,6 +660,7 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   else if ((len == 3U) && (nm[0]=='s') && (nm[1]=='k') && (nm[2]=='i')) tune_speed_ki   = v;
   else if ((len == 3U) && (nm[0]=='s') && (nm[1]=='p') && (nm[2]=='d')) tune_target     = v;
   else if ((len == 3U) && (nm[0]=='t') && (nm[1]=='l') && (nm[2]=='m')) tune_turn_lim   = v;
+  else if ((len == 2U) && (nm[0]=='r') && (nm[1]=='v')) tune_inner_rev  = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='z')) tune_ccr_zero    = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='p')) tune_ccr_per_mp  = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='x')) tune_ccr_max     = v;
@@ -618,6 +674,7 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   tune_speed_ki  = Limit(tune_speed_ki, 0.0f, 10000.0f);
   tune_target    = Limit(tune_target, 0.0f, SPEED_LIMIT_MPS);
   tune_turn_lim  = Limit(tune_turn_lim, 0.0f, SPEED_LIMIT_MPS);
+  tune_inner_rev = Limit(tune_inner_rev, 0.0f, SPEED_LIMIT_MPS);
   tune_ccr_zero  = Limit(tune_ccr_zero, 0.0f, 7199.0f);
   tune_ccr_per_mp = Limit(tune_ccr_per_mp, 0.0f, 20000.0f);
   tune_ccr_max   = Limit(tune_ccr_max, 0.0f, 7199.0f);
@@ -627,11 +684,12 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
 
 static void Tune_Print(void)
 {
-  printf("cfg,lkp=%ld,lkd=%ld,spd=%ld,tlm=%ld,skp=%ld,ski=%ld,cz=%ld,cp=%ld,cx=%ld,l=%ld\r\n",
+  printf("cfg,lkp=%ld,lkd=%ld,spd=%ld,tlm=%ld,rv=%ld,skp=%ld,ski=%ld,cz=%ld,cp=%ld,cx=%ld,l=%ld\r\n",
          (long)(tune_line_kp * 1000.0f),
          (long)(tune_line_kd * 10000.0f),
          (long)(tune_target * 1000.0f),
          (long)(tune_turn_lim * 1000.0f),
+         (long)(tune_inner_rev * 1000.0f),
          (long)tune_speed_kp,
          (long)tune_speed_ki,
          (long)tune_ccr_zero,
