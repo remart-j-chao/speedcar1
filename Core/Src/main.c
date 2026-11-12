@@ -75,6 +75,10 @@
 
 /* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
 #define LINE_SENSOR_ACTIVE_LEVEL 1U
+/* 同时压线的路数达到这个值就判为十字路口 / 横向宽线：保持上一次偏差直穿，
+   而不是用加权平均算出一个假偏差（实测 011111100000 会得出 -2333，
+   车会朝空地打舵）。正常赛道线宽只覆盖 1~3 路。 */
+#define LINE_JUNCTION_ACTIVE_MIN 5U
 #define LINE_SAMPLE_MS          10U
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
@@ -593,6 +597,16 @@ static void LineSensor_Update(void)
   {
     line_error_milli = 0;
     line_sensor_valid = 0U;
+    return;
+  }
+
+  /* 十字路口 / 宽线：12 路里 5 路以上同时压线，说明横向还有一条线穿过去，
+     此时加权平均会算出一个"假偏差"（例如 011111100000 得 -2333），
+     车会朝空地打舵。正确做法是保持上一次有效偏差直着穿过去。
+     正常赛道线宽只会覆盖 1~3 路。 */
+  if (active_count >= LINE_JUNCTION_ACTIVE_MIN)
+  {
+    line_sensor_valid = 1U;
     return;
   }
 
