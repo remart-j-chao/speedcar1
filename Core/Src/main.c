@@ -281,10 +281,9 @@ static volatile uint16_t fault_ccr_r;
    解决办法是不靠光电管，直接用陀螺仪积分出来的航向角闭环转过固定角度。 */
 /* 目标转角（度）。85~90 之间；设 0 可整体关闭该功能。 */
 #define CORNER_TURN_DEG            88.0f
-/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 4 路，
-   即"最外侧两三路压线、内侧全脱"——这是直角弯的典型特征。
-   3500 对应重心落到外侧 3~4 路，比原来的 4500 更早识别，入弯更及时。 */
-#define CORNER_DETECT_ERR          3500
+/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 4 路。
+   4000 是 3500（太灵敏、会误触发）与 4500（太迟钝）之间的折中值。 */
+#define CORNER_DETECT_ERR          4000
 #define CORNER_DETECT_MAX_ACTIVE   4U
 /* 连续满足多少个控制周期才认账，避免单帧误触发。 */
 #define CORNER_DETECT_TICKS        2U
@@ -300,9 +299,9 @@ static volatile uint16_t fault_ccr_r;
    Z 字弯的两个折角间隔很短，冷却太长会漏掉第二个折角，故取 150 ms。 */
 #define CORNER_COOLDOWN_MS         150U
 /* 直角弯转角阶段的车速比例（相对基本速）。
-   1.15 表示转角时反而略快一点：车在转的同时还要前进，
-   速度太低会变成原地打转、外侧轮顶到差速上限反而转不动。 */
-#define CORNER_SPEED_SCALE         1.15f
+   1.0 = 与基本速相同。不要低于 0.9：太慢会变成原地打转、外侧轮顶到差速上限；
+   也不要高于 1.3：太快会让 88 度的转角画出很大的弧线而切出赛道。 */
+#define CORNER_SPEED_SCALE         1.00f
 #define CORNER_COOLDOWN_TICKS      (CORNER_COOLDOWN_MS / CONTROL_UPDATE_MS)
 /* 反转自检窗口：目标为负、实测仍向前超过 400 ms 即判定方向脚没生效。 */
 #define REV_CHECK_MS               400U
@@ -546,6 +545,8 @@ static volatile float tune_corner_deg = CORNER_TURN_DEG;
 /* 直角弯识别阈值与转角车速比例，都可在运行中用 cth / cspd 命令改写。 */
 static volatile float tune_corner_detect_err = (float)CORNER_DETECT_ERR;
 static volatile float tune_corner_speed_scale = CORNER_SPEED_SCALE;
+/* ctest 命令的一次性触发请求：1 = 强制左转一次，-1 = 强制右转一次。 */
+static volatile int8_t corner_test_request;
 static uint8_t  corner_state;            /* 0 = 循迹，1 = 直角弯转角中 */
 static float    corner_target_angle;
 static uint16_t corner_ticks;
@@ -822,7 +823,7 @@ static void GyroBias_Restart(void)
 
 static const char *const tune_names[] =
 {
-  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm", "srch", "cth", "cspd"
+  "lkp", "lkd", "ykp", "yki", "ykd", "skp", "ski", "spd", "dzl", "dzr", "sff", "stl", "ysg", "ofs", "yff", "lsg", "pol", "yt", "rev", "c90", "ydm", "srch", "cth", "cspd", "ctest"
 };
 
 /* 通道号与宏一一对应：1=lKp 2=lKd 3=yKp 4=yKi 5=yKd 6=sKp 7=sKi 8=目标速度 9/10=左右死区 */
@@ -928,6 +929,14 @@ static void Tune_ApplyParameter(uint8_t index, float value)
         tune_corner_speed_scale = 1.6f;
       else
         tune_corner_speed_scale = value;
+      break;
+    case 25U: /* ctest=1 强制左转一次，ctest=-1 强制右转一次，ctest=0 取消 */
+      if (value > 0.5f)
+        corner_test_request = 1;
+      else if (value < -0.5f)
+        corner_test_request = -1;
+      else
+        corner_test_request = 0;
       break;
     default: return;
   }
@@ -1291,7 +1300,7 @@ static void Tune_ExecuteLine(const char *line, uint8_t len)
     return;
   }
 
-  for (k = 0U; k < 24U; ++k)
+  for (k = 0U; k < 25U; ++k)
   {
     if (Tune_NameMatch(line, name_len, tune_names[k]) != 0U)
     {
@@ -1718,6 +1727,22 @@ static void VehicleControl_Update(void)
         corner_event = 1U;
         corner_event_angle = control_yaw_angle;
       }
+    }
+
+    /* 强制触发一次直角弯（ctest=1 左转 / ctest=-1 右转）。
+       用于在没有赛道、或不确定识别条件是否命中时，单独验证状态机
+       和角度环本身能不能把车准确转过 c90 度。
+       用完记得发 ctest=0 复位。 */
+    if (corner_test_request != 0)
+    {
+      corner_target_angle = control_yaw_angle +
+          ((corner_test_request > 0) ? tune_corner_deg : -tune_corner_deg);
+      corner_state = 1U;
+      corner_ticks = 0U;
+      corner_detect_ticks = 0U;
+      corner_event = 1U;
+      corner_event_angle = control_yaw_angle;
+      corner_test_request = 0;
     }
   }
   else
@@ -2309,7 +2334,7 @@ int main(void)
           ((HAL_GetTick() - control_print_tick) >= SPEED_PRINT_MS))
       {
         control_print_tick = HAL_GetTick();
-        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u,%ld,%ld,%ld\r\n",
+        printf("ctrl,%u,%u,%u,%ld,%ld,%ld,%u,%u,%ld,%ld,%ld,%d,%u,%ld\r\n",
                (unsigned int)run_button_started,
                (unsigned int)line_sensor_valid,
                (unsigned int)imu_ready,
@@ -2320,7 +2345,10 @@ int main(void)
                (unsigned int)control_right_pwm,
                (long)(control_measured_yaw_rate_dps * 1000.0f),
                (long)(control_yaw_diff_mps * 1000.0f),
-               (long)(control_yaw_angle * 10.0f));
+               (long)(control_yaw_angle * 10.0f),
+               (int)line_error_milli,
+               (unsigned int)corner_state,
+               (long)(control_speed_target_mps * 1000.0f));
       }
     }
 #endif
