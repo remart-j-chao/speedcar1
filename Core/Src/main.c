@@ -194,15 +194,13 @@ static volatile uint16_t fault_ccr_r;
                                             线性映射（除以 3 拉平后）在 err=1 时给 35 dps，
                                             直道太抖；err=6 时只给 210 dps，急弯又不够。
                                             这才是"直道画龙 + 弯道冲出去"同时出现的根源。 */
-#define LINE_PD_KD                 0.8f  /* 目标角速度 / 循迹误差变化率（提前量）。
-                                           单位是 (dps)/(权重/秒)：偏差每 10 ms 变化 1 个权重
-                                           就是 100 单位/秒，所以 0.8 约给 80 dps 的提前量。
-                                           串联双环从"看见偏差"到"车身转起来"有 150 ms 以上的滞后，
-                                           等 P 项把误差放大到 4 路以上再打舵已经来不及了，
-                                           进弯提前量只能靠 D 给。0.3 时只有 30 dps，杯水车薪。
-                                           直道抖动靠 LINE_DERIV_FILTER 压住。 */
-/* 微分一阶低通系数（0~1，越大越平滑）。 */
-#define LINE_DERIV_FILTER          0.6f
+#define LINE_PD_KD                 0.5f  /* 目标角速度 / 循迹误差变化率（提前量）。
+                                           单位是 (dps)/(权重/秒)：偏差每 30 ms 变化 1 个权重
+                                           就是 33 单位/秒，所以 0.5 约给 17 dps —— 温和的提前量。
+                                           串联双环滞后 150 ms 以上，D 项负责在误差还没长大时
+                                           就先打一点方向；但给太多会和量化噪声一起变成抖动源。 */
+/* 微分窗口（采样次数）：用 30 ms 差商代替 10 ms 单步差分，压掉整数跳变尖峰。 */
+#define LINE_DERIV_SPAN            3U
 /* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
    必须与角速度环的方向一致：
    差速为正 → 左轮慢右轮快 → 车向左（逆时针）转；
@@ -258,6 +256,9 @@ static volatile uint16_t fault_ccr_r;
    只在内轮目标被压到负数时才启用，直道和缓弯完全不受影响。
    取 0。25 是折中：再大差速收益变小，而反向电流冲击和轮胎拖滑明显增加。 */
 #define YAW_INNER_REVERSE_MPS      0.25f
+/* 差速指令的最大变化率（m/s²）。0 表示不限制。
+   防止前馈阶跃直接砸到速度环上造成过冲。 */
+#define YAW_DIFF_SLEW_MPS2         12.0f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
 #define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
@@ -476,6 +477,8 @@ static uint8_t YawTest_Active(void)
 /* 内轮允许反转的最大速度（m/s），可在运行中用 rev 命令改写。
    设为 0 即退回"内轮最低停转"的旧行为，便于一键对比。 */
 static volatile float tune_inner_reverse_mps = YAW_INNER_REVERSE_MPS;
+/* 差速指令的斜坡状态（跨周期保留，见 VehicleControl_Update）。 */
+static float yaw_diff_slewed;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -1276,6 +1279,7 @@ static void VehicleControl_Reset(ControlLoopState *line_state,
   control_target_yaw_rate_dps = 0.0f;
   control_measured_yaw_rate_dps = 0.0f;
   control_yaw_diff_mps = 0.0f;
+  yaw_diff_slewed = 0.0f;
   control_turn_pwm = 0.0f;
   control_base_pwm = 0.0f;
   control_speed_target_mps = 0.0f;
@@ -1349,8 +1353,10 @@ static void VehicleControl_Update(void)
   static float yaw_rate_filtered;
   const float dt = (float)CONTROL_UPDATE_MS / 1000.0f;
   float line_error;
-  /* 微分必须跨周期保留，否则一阶低通每 10 ms 都被重置，滤波等于没做。 */
-  static float line_derivative;
+  /* 微分用 3 个采样间隔的差商：history 保存 30 ms 前的偏差。 */
+  static float line_error_hist[LINE_DERIV_SPAN];
+  static uint8_t line_hist_index;
+  float line_derivative;
   float yaw_rate;
   float yaw_error;
   float yaw_derivative;
@@ -1420,21 +1426,26 @@ static void VehicleControl_Update(void)
     }
     else
     {
+      uint8_t i;
+
       /* 将循迹误差从千分之一权重还原为传感器权重。 */
       line_error = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
-      /* 重新压线的第一个周期不计算微分，避免偏差跳变造成打舵尖峰 */
+      /* 重新压线的第一个周期先填满历史，避免偏差跳变造成打舵尖峰 */
       if ((line_state.initialized != 0U) && (line_lost_ticks == 0U))
       {
-        float derivative_raw = (line_error - line_state.previous_error) / dt;
-        /* 光电管是离散的，微分会带 ±100 单位/秒的量化尖峰；
-           一阶低通既压住噪声，又保留进弯时的主要趋势，才能把 D 项真正用起来。 */
-        line_derivative = (LINE_DERIV_FILTER * line_derivative) +
-                          ((1.0f - LINE_DERIV_FILTER) * derivative_raw);
+        /* 微分用 3 个采样间隔（30 ms）的差商，而不是 10 ms 单步差分。
+           光电管是整数跳变的，单步差分会带 ±150 单位/秒的量化尖峰，
+           D 项一放大就变成抖动源；30 ms 窗口把尖峰压到 1/3，滞后只多 10 ms。 */
+        line_derivative = (line_error - line_error_hist[line_hist_index]) /
+                          (dt * (float)LINE_DERIV_SPAN);
       }
       else
       {
         line_derivative = 0.0f;
       }
+      line_error_hist[line_hist_index] = line_error;
+      i = (uint8_t)(line_hist_index + 1U);
+      line_hist_index = (i >= LINE_DERIV_SPAN) ? 0U : i;
       line_lost_ticks = 0U;
     }
     control_target_yaw_rate_dps = Control_Clamp(
@@ -1501,10 +1512,30 @@ static void VehicleControl_Update(void)
   /* 差速 = 前馈（按目标角速度给权限）+ P 项（按误差修正），整体限幅。
      前馈负责"转得动"（急弯需要 0.3 m/s 以上差速），
      P 项负责"转得准"，两者分开后增益与权限不再互相牵制。 */
-  yaw_differential_mps = Control_Clamp(
-      (tune_yaw_ff * control_target_yaw_rate_dps) +
-      (control_turn_pwm / YAW_DIFF_PWM_PER_MPS),
-      -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
+  {
+    float diff_cmd;
+
+    diff_cmd = Control_Clamp(
+        (tune_yaw_ff * control_target_yaw_rate_dps) +
+        (control_turn_pwm / YAW_DIFF_PWM_PER_MPS),
+        -YAW_DIFF_LIMIT_MPS, YAW_DIFF_LIMIT_MPS);
+
+    /* 差速斜坡限制：误差一跳，前馈就会给出一个阶跃的差速指令，
+       而轮速从 0.45 变到 −0.2 需要几十毫秒，速度环根本跟不上阶跃，
+       结果就是"指令先到位、车身后到位"，必然过冲再摆回来。
+       限制变化率后，指令和轮速同速跟上，过冲显著减小。
+       12 m/s² 时从 0 到满差速 0.70 需要 58 ms，对 0.35 m/s 的车足够快。 */
+    {
+      const float max_step = YAW_DIFF_SLEW_MPS2 * dt;
+
+      if (diff_cmd > yaw_diff_slewed + max_step)
+        diff_cmd = yaw_diff_slewed + max_step;
+      else if (diff_cmd < yaw_diff_slewed - max_step)
+        diff_cmd = yaw_diff_slewed - max_step;
+    }
+    yaw_diff_slewed = diff_cmd;
+    yaw_differential_mps = diff_cmd;
+  }
   control_yaw_diff_mps = yaw_differential_mps;
 
   {
