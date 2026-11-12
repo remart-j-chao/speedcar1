@@ -87,7 +87,7 @@
 #define R_DIR_REVERSE           GPIO_PIN_RESET
 
 /* ---------------- 车速 ---------------- */
-#define SPEED_TARGET_MPS        0.80f    /* 基本速 */
+#define SPEED_TARGET_MPS        0.30f    /* 基本速 */
 #define SPEED_LIMIT_MPS         1.20f    /* 单轮目标速度上限 */
 #define SPEED_ACCEL_MPS2        1.5f     /* 起步加速度限制 */
 
@@ -113,11 +113,15 @@
    前馈先把它算掉，PI 只补残差，这样即使标定不准也不会慢慢吞吞地爬。
    单位：CCR 每 (m/s)；SPEED_KP/ KI 也是 CCR 单位。 */
 #define MOTOR_CCR_MAX           1000U    /* CCR 上限（约 14% 占空比，留有余量） */
-#define MOTOR_CCR_ZERO          27.0f
-#define MOTOR_CCR_PER_MPS       765.0f
+#define MOTOR_CCR_ZERO          170.0f
+#define MOTOR_CCR_PER_MPS       325.0f
+/* 内侧轮反转时的最低 CCR。低于这个值电机几乎没有扭矩，
+   会被地面"拖着正转"，转速差就做不出来（实测 CCR 288 仍被拖到 +0.22 m/s）。 */
+#define MOTOR_CCR_HOLD          340.0f
 #define SPEED_KP_CCR            300.0f
-#define SPEED_KI_CCR            2000.0f
-#define SPEED_I_LIMIT_CCR       700.0f
+#define SPEED_KI_CCR            6000.0f
+/* 积分项的**输出**上限（CCR）。积分只补前馈残差，不需要很大，也避免绕圈。 */
+#define SPEED_I_OUT_LIMIT       400.0f
 
 /* ---------------- 安全 ---------------- */
 #define LINE_LOST_STOP_MS       300U     /* 丢线超过此时间就停机 */
@@ -273,6 +277,7 @@ static volatile float tune_speed_ki  = SPEED_KI_CCR;
 static volatile float tune_ccr_zero  = MOTOR_CCR_ZERO;
 static volatile float tune_ccr_per_mp = MOTOR_CCR_PER_MPS;
 static volatile float tune_ccr_max   = (float)MOTOR_CCR_MAX;
+static volatile float tune_hold_ccr  = MOTOR_CCR_HOLD;
 
 /* ---- 循迹传感器 ---- */
 static volatile uint16_t line_bits;         /* 12 路原始位图 */
@@ -344,30 +349,71 @@ static uint16_t Line_ActiveCount(uint16_t bits)
 }
 
 /* 压线过多时（十字、环岛入口、宽黑区）加权平均会被拉向中间，
-   直接用会"看见分叉却当没看见"。这里改用最左和最右压线通道的中点判方向：
-     - 对称的十字（最左和最右都在）-> 0，直行
-     - 一侧有分叉（环岛入口、岔路）-> 偏向那一侧，跟着拐进去
+   直接用会"看见分叉却当没看见"。这里分两种情况处理：
+
+   1) 压线通道**中间有断档**（例如 1100011，左右各一段）：
+      这是"分叉/环岛入口"——主线 + 旁边支线同时被看到。
+      取"离中心更远的那一段"的加权平均，才能真的拐进去。
+
+   2) 压线通道**连续**（例如 00111100）：
+      这是宽线/十字路口的黑区。取最左最右的中点：
+      对称的十字 -> 0（直行），一侧偏 -> 跟着偏。
+
    返回单位与 line_error_milli 一致（千分之一权重）。 */
-static int16_t Line_EdgeError(void)
+static int16_t Line_WideError(void)
 {
-  int16_t first = -1, last = -1;
+  int32_t run_sum[4];
+  uint16_t run_cnt[4];
+  int16_t run_first[4];
+  uint8_t runs = 0U, best = 0U, i;
+  uint8_t prev_active = 0U;
   uint16_t ch;
 
   for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
   {
-    if (MUX_GET_CHANNEL(line_bits, ch) == LINE_ACTIVE_LEVEL)
-    {
-      if (first < 0) first = (int16_t)ch;
-      last = (int16_t)ch;
-    }
-  }
-  if ((first < 0) || (last < 0)) return 0;
+    uint8_t active = (MUX_GET_CHANNEL(line_bits, ch) == LINE_ACTIVE_LEVEL) ? 1U : 0U;
 
+    if (active)
+    {
+      int32_t w = (ch < 6U) ? ((int32_t)ch - 6L) : ((int32_t)ch - 5L);
+
+      if ((prev_active == 0U) && (runs < 4U))
+      {
+        run_sum[runs] = 0;
+        run_cnt[runs] = 0U;
+        run_first[runs] = (int16_t)ch;
+        ++runs;
+      }
+      if (runs > 0U)
+      {
+        run_sum[runs - 1U] += w;
+        ++run_cnt[runs - 1U];
+      }
+    }
+    prev_active = active;
+  }
+
+  if (runs == 0U) return 0;
+
+  if (runs == 1U)
   {
+    /* 连续宽线：用最左最右的中点 */
+    int16_t first = run_first[0];
+    int16_t last = (int16_t)(run_first[0] + (int16_t)run_cnt[0] - 1);
     int32_t w_first = (first < 6) ? ((int32_t)first - 6L) : ((int32_t)first - 5L);
     int32_t w_last  = (last  < 6) ? ((int32_t)last  - 6L) : ((int32_t)last  - 5L);
     return (int16_t)(((w_first + w_last) * LINE_ERROR_SCALE) / 2L);
   }
+
+  /* 多段（分叉）：取"平均位置离中心最远"的那一段 */
+  for (i = 1U; i < runs; ++i)
+  {
+    int32_t a = (run_sum[i] < 0) ? -run_sum[i] : run_sum[i];
+    int32_t b = (run_sum[best] < 0) ? -run_sum[best] : run_sum[best];
+    if (a > b) best = i;
+  }
+  if (run_cnt[best] == 0U) return 0;
+  return (int16_t)((run_sum[best] * LINE_ERROR_SCALE) / (int32_t)run_cnt[best]);
 }
 
 /* 读 12 路光电管，算出加权平均偏差。
@@ -524,7 +570,7 @@ static void Control_Update(void)
     int16_t e_milli = line_error_milli;
     uint8_t wide = (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT) ? 1U : 0U;
 
-    if (wide) e_milli = Line_EdgeError();
+    if (wide) e_milli = Line_WideError();
 
     err = tune_line_sign * ((float)e_milli / (float)LINE_ERROR_SCALE);
     /* 宽黑区里偏差本来就会突变，D 项会给出吓人的反向脉冲，直接掐掉 */
@@ -578,9 +624,13 @@ static void Control_Update(void)
     }
     else
     {
-      speed_i_l = Limit(speed_i_l + (e_l * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+      /* speed_i_* 存的就是积分项的**输出**（CCR），换 ki 不会让旧积分突然放大 */
+      speed_i_l = Limit(speed_i_l + (tune_speed_ki * e_l * dt),
+                        -SPEED_I_OUT_LIMIT, SPEED_I_OUT_LIMIT);
       ccr_l = tune_ccr_zero + (tune_ccr_per_mp * mag_t_l) +
-              (tune_speed_kp * e_l) + (tune_speed_ki * speed_i_l);
+              (tune_speed_kp * e_l) + speed_i_l;
+      /* 反转时给一个扭矩下限，否则电机没劲、被地面拖着正转 */
+      if (dir_l < 0.0f) ccr_l = Limit(ccr_l, tune_hold_ccr, tune_ccr_max);
     }
 
     if (mag_t_r <= 0.0f)
@@ -590,9 +640,11 @@ static void Control_Update(void)
     }
     else
     {
-      speed_i_r = Limit(speed_i_r + (e_r * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+      speed_i_r = Limit(speed_i_r + (tune_speed_ki * e_r * dt),
+                        -SPEED_I_OUT_LIMIT, SPEED_I_OUT_LIMIT);
       ccr_r = tune_ccr_zero + (tune_ccr_per_mp * mag_t_r) +
-              (tune_speed_kp * e_r) + (tune_speed_ki * speed_i_r);
+              (tune_speed_kp * e_r) + speed_i_r;
+      if (dir_r < 0.0f) ccr_r = Limit(ccr_r, tune_hold_ccr, tune_ccr_max);
     }
 
     ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
@@ -664,6 +716,7 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='z')) tune_ccr_zero    = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='p')) tune_ccr_per_mp  = v;
   else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='x')) tune_ccr_max     = v;
+  else if ((len == 2U) && (nm[0]=='h') && (nm[1]=='c')) tune_hold_ccr    = v;
   else if ((len == 1U) && (nm[0]=='l')) tune_line_sign = (v < 0.0f) ? -1.0f : 1.0f;
   else { printf("err,name\r\n"); return; }
 
@@ -678,13 +731,14 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   tune_ccr_zero  = Limit(tune_ccr_zero, 0.0f, 7199.0f);
   tune_ccr_per_mp = Limit(tune_ccr_per_mp, 0.0f, 20000.0f);
   tune_ccr_max   = Limit(tune_ccr_max, 0.0f, 7199.0f);
+  tune_hold_ccr  = Limit(tune_hold_ccr, 0.0f, 7199.0f);
 
   printf("set,%s,%ld\r\n", nm, (long)(v * 1000.0f));
 }
 
 static void Tune_Print(void)
 {
-  printf("cfg,lkp=%ld,lkd=%ld,spd=%ld,tlm=%ld,rv=%ld,skp=%ld,ski=%ld,cz=%ld,cp=%ld,cx=%ld,l=%ld\r\n",
+  printf("cfg,lkp=%ld,lkd=%ld,spd=%ld,tlm=%ld,rv=%ld,skp=%ld,ski=%ld,cz=%ld,cp=%ld,cx=%ld,hc=%ld,l=%ld\r\n",
          (long)(tune_line_kp * 1000.0f),
          (long)(tune_line_kd * 10000.0f),
          (long)(tune_target * 1000.0f),
@@ -695,6 +749,7 @@ static void Tune_Print(void)
          (long)tune_ccr_zero,
          (long)tune_ccr_per_mp,
          (long)tune_ccr_max,
+         (long)tune_hold_ccr,
          (long)tune_line_sign);
 }
 
