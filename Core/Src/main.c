@@ -74,7 +74,7 @@
 #define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
 
 /* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
-#define LINE_SENSOR_ACTIVE_LEVEL 0U
+#define LINE_SENSOR_ACTIVE_LEVEL 1U
 #define LINE_SAMPLE_MS          10U
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
@@ -89,7 +89,12 @@
    熟练后再用 spd=0.6 / 0.7 在线提速。若为 0，车不会动。 */
 #define CONTROL_TARGET_SPEED_MPS   0.60f
 #define CONTROL_MAX_PWM_CCR        700.0f
-#define CONTROL_MAX_YAW_RATE_DPS   180.0f
+/* 目标角速度上限。这条是最容易被忽略的"隐形天花板"：
+   lkp=35、误差 6 时目标是 210 dps，超过 180 就被削平，
+   于是把 lkp 从 35 加到 55（最高 330 dps）完全没有区别 —— 全被削掉。
+   急弯需要 200~300 dps，所以放到 300。
+   真正的物理上限由差速和外侧轮最高转速决定，由 YAW_DIFF_LIMIT_MPS 兜底。 */
+#define CONTROL_MAX_YAW_RATE_DPS   300.0f
 
 /* 陀螺仪安装方向修正：让“左转（俯视逆时针回正）”对应正角速度。
    判据不靠手转手感，而看闭环符号：yt 阶跃测试里 ykp=0 时 diff≈+0.22 m/s，
@@ -161,8 +166,11 @@ static volatile uint16_t fault_ccr_r;
                                             纯 P 循迹的稳态偏差 = 所需角速度 / Kp：
                                             0.3 m 弯 @0.5 m/s 需 95 dps，Kp=35 时偏差约 2.7 路，
                                             Kp=20 要 4.8 路（已接近出界），所以不能更小。 */
-#define LINE_PD_KD                 0.1f  /* 目标角速度 / 循迹误差变化率（抑制过冲）。
-                                           13 路插值、10 ms 周期下 Δerr=1 约给 10 dps。 */
+#define LINE_PD_KD                 0.3f  /* 目标角速度 / 循迹误差变化率（提前量）。
+                                           单位是 (dps)/(权重/秒)：偏差每 10 ms 变化 1 个权重
+                                           就是 100 单位/秒，所以 0.3 约给 30 dps —— 用来
+                                           在进弯瞬间提前打舵，弥补串联双环固有的滞后。
+                                           直道画龙就减到 0.15，进弯仍然迟就加到 0.5。 */
 /* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
    必须与角速度环的方向一致：
    差速为正 → 左轮慢右轮快 → 车向左（逆时针）转；
@@ -199,8 +207,11 @@ static volatile uint16_t fault_ccr_r;
    但速度环追不满指令差速（右轮目标接近 0.85 m/s 时实测只有 0.74），
    所以取 0.0025 略高于理论值，用一点超前来抵消执行机构的滞后。 */
 #define YAW_DIFF_FF_MPS_PER_DPS    0.0025f
-/* 单次差速偏置上限，防止饱和打转。 */
-#define YAW_DIFF_LIMIT_MPS         0.40f
+/* 单次差速偏置上限，防止饱和打转。
+   0.55 在 spd=0.6 时意味着内轮目标可降到 0.05（几乎原地转），
+   对应实际差速约 0.4 m/s、角速度约 270 dps、转弯半径约 0.13 m，
+   足以进任何比赛弯道。取太小（0.40）会在急弯里提前削掉前馈。 */
+#define YAW_DIFF_LIMIT_MPS         0.55f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
 #define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
