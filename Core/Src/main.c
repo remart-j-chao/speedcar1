@@ -35,11 +35,99 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 陀螺仪调试打印开关。置 1 会引入约 5.4 kB 的浮点 printf 代码，
-   MDK-Lite 的 32 kB 链接上限会因此报 L6047U 而链接失败。
-   平时保持 0；要串口看数据时改成 1（并注意镜像大小）。 */
-#define GYRO_DEBUG 1
-#define IF_start_Brushless_motor 1 //是否启动无刷电机，1为启动，0为不启动
+/* 负压风扇：开发阶段保持 0（不启动无刷电调），
+   只有明确要测试风扇时才改成 1。
+   注意：改成 1 后启动流程会阻塞约 2 s（等待负压建立），上电时不要用车。 */
+#define IF_start_Brushless_motor 0
+
+/* ==========================================================================
+   循迹控制参数（转向控制方法三：转向环 PD - 速度环 PI，不使用陀螺仪）
+   --------------------------------------------------------------------------
+   转向环：偏差 -> 转向量（左右轮速度差），用 PD
+       转向量 = LINE_KP × 偏差 + LINE_KD × 偏差变化率
+       转向量为正 = 右转 = 左轮加速、右轮减速
+   速度环：每轮独立 PI，把左右轮实际车速拉到目标值
+       目标左轮 = 基本车速 + 转向量，目标右轮 = 基本车速 - 转向量
+   转向环不用积分：积分会在弯道里累积、出弯时反向过冲（画龙）。
+   速度环必须用积分：直流电机低速段有死区、摩擦力不一致，
+   纯 P 存在稳态误差，左右轮对不上。
+   ========================================================================== */
+
+/* 控制周期：TIM2 配成 1 kHz，再分频到 10 ms。 */
+#define CTRL_PERIOD_MS          10U
+#define CTRL_DT                 ((float)CTRL_PERIOD_MS / 1000.0f)
+
+/* ---------------- 光电管 ---------------- */
+/* 判定为"压线"的电平。若实测模块输出相反，把 1U 改成 0U。 */
+#define LINE_ACTIVE_LEVEL       1U
+/* 偏差的内部单位是"千分之一权重"，便于整数打印与在线调参。 */
+#define LINE_ERROR_SCALE        1000L
+/* 偏差方向：通道 0 在最左、权重 -6；通道 11 在最右、权重 +6，
+   所以偏差为正 = 线在车体右侧。转向约定：转向量为正 = 右转
+   （左轮加速、右轮减速）。因此这里默认 +1。 */
+#define LINE_ERROR_SIGN         1.0f
+/* 如果落地实测发现"线在右边却往左打"，把串口命令 l 设成 -1 即可，不用改代码。 */
+#define LINE_SAMPLE_MS          10U
+/* 同时压线的路数达到这个值就认为是十字/宽黑区，沿用上次偏差。 */
+#define LINE_WIDE_ACTIVE_COUNT  5U
+
+/* ---------------- 编码器 ---------------- */
+/* 每米计数：按实测标定（推 1 m 读 odom 累计值）。 */
+#define ENC_COUNTS_PER_METER    37385.0f
+#define ENC_L_SIGN              1
+#define ENC_R_SIGN              (-1)
+/* 速度滑动平均窗长（样本数），3 × 10 ms = 30 ms。 */
+#define ENC_AVG_SAMPLES         3U
+
+/* ---------------- 电机输出 ---------------- */
+/* TIM1 的 ARR 是 7199，占空比 = CCR / 7200。 */
+#define L_DIR_FORWARD           GPIO_PIN_RESET
+#define R_DIR_FORWARD           GPIO_PIN_SET
+
+/* ---------------- 车速 ---------------- */
+#define SPEED_TARGET_MPS        0.40f    /* 基本速 */
+#define SPEED_LIMIT_MPS         1.20f    /* 单轮目标速度上限 */
+#define SPEED_ACCEL_MPS2        1.5f     /* 起步加速度限制 */
+
+/* ---------------- 转向环：PD ---------------- */
+/* 偏差单位是"权重"：12 路光电管，加权平均后范围约 ±6。
+   转向输出直接就是左右轮的速度差（m/s），不再经过陀螺仪内环。
+   LINE_KP = 0.10 时，偏差到 4.5 个权重就吃满转向上限，最外侧还能有富余。 */
+#define LINE_KP                 0.10f    /* (m/s) / 权重 */
+#define LINE_KD                 0.0025f  /* (m/s) / (权重/s) */
+#define LINE_D_LPF_ALPHA        0.8f     /* 偏差变化率低通，抑制量化跳变尖峰 */
+/* 转向（差速）上限，m/s。这是"急弯转得动转不动"的关键量： */
+/* 车身轮距约 0.186 m，角速度 = 2×差速/轮距，差速 0.45 m/s 约等于 4.8 rad/s。 */
+#define TURN_LIMIT_MPS          0.45f
+
+/* ---------------- 速度环（每轮独立 PI，直接以 CCR 为单位） ---------------- */
+/* TIM1 的 ARR 是 7199，占空比 = CCR / 7200。
+   直流电机转速对 CCR 是仿射关系（有一段不转的死区，之后近似线性）：
+       需要的 CCR ≈ MOTOR_CCR_ZERO + MOTOR_CCR_PER_MPS × 车速
+   这两个常数按实测两点拟合（静止不转的点 + 已知车速的点），
+   前馈先把它算掉，PI 只补残差，这样即使标定不准也不会慢慢吞吞地爬。
+   单位：CCR 每 (m/s)；SPEED_KP/ KI 也是 CCR 单位。 */
+#define MOTOR_CCR_MAX           1000U    /* CCR 上限（约 14% 占空比，留有余量） */
+#define MOTOR_CCR_ZERO          27.0f
+#define MOTOR_CCR_PER_MPS       765.0f
+#define SPEED_KP_CCR            300.0f
+#define SPEED_KI_CCR            2000.0f
+#define SPEED_I_LIMIT_CCR       700.0f
+
+/* ---------------- 安全 ---------------- */
+#define LINE_LOST_STOP_MS       300U     /* 丢线超过此时间就停机 */
+#define LINE_LOST_STOP_TICKS    (LINE_LOST_STOP_MS / CTRL_PERIOD_MS)
+#define STALL_MS                800U
+#define STALL_TICKS             (STALL_MS / CTRL_PERIOD_MS)
+#define STALL_CCR_MIN           300.0f   /* 左右至少一轮给到这么多 CCR 才算"在驱动" */
+#define STALL_SPEED_MPS         0.03f
+#define RUN_GRACE_MS            1000U
+#define RUN_GRACE_TICKS         (RUN_GRACE_MS / CTRL_PERIOD_MS)
+
+/* ---------------- 串口在线调参 ---------------- */
+#define TUNE_RX_BUF             64U
+#define TUNE_LINE_IDLE_MS       120U
+#define TUNE_PRINT_MS           100U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -117,8 +205,7 @@ static void ESC_fullPulseWidth(void){
 /* One interrupt per 20 ms frame: DMA transfer complete in circular mode.
    The 50 Hz waveform itself is produced by TIM1 + DMA in hardware; this
    handler only counts frames and switches 0.9 ms -> 2.0 ms after 2 s. */
-static void ESC_DmaTransferComplete(DMA_HandleTypeDef *hdma)
-{
+static void ESC_DmaTransferComplete(DMA_HandleTypeDef *hdma){
   if (esc_period_count < ESC_START_PERIODS)
   {
     ++esc_period_count;
@@ -149,6 +236,12 @@ static void MX_TIM3_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
+static void LineSensor_Update(void);
+static void Encoder_UpdateSpeed(void);
+static void DwtCyccnt_Init(void);
+static void Control_Update(void);
+static void RunButton_Update(void);
+static void Tune_Service(uint32_t now);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -158,7 +251,496 @@ int fputc(int ch, FILE *f)
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xffff);
   return ch;
 }
-float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
+
+/* ==========================================================================
+   循迹控制：转向环 PD + 速度环 PI（转向控制方法三，不使用陀螺仪）
+   ========================================================================== */
+
+/* ---- 可在线整定的参数：上电取宏，运行中由串口改写 ---- */
+static volatile float tune_line_kp   = LINE_KP;
+static volatile float tune_line_kd   = LINE_KD;
+static volatile float tune_line_sign = LINE_ERROR_SIGN;
+static volatile float tune_turn_lim  = TURN_LIMIT_MPS;
+static volatile float tune_target    = SPEED_TARGET_MPS;
+static volatile float tune_speed_kp  = SPEED_KP_CCR;
+static volatile float tune_speed_ki  = SPEED_KI_CCR;
+static volatile float tune_ccr_zero  = MOTOR_CCR_ZERO;
+static volatile float tune_ccr_per_mp = MOTOR_CCR_PER_MPS;
+static volatile float tune_ccr_max   = (float)MOTOR_CCR_MAX;
+
+/* ---- 循迹传感器 ---- */
+static volatile uint16_t line_bits;         /* 12 路原始位图 */
+static volatile int16_t  line_error_milli;  /* 偏差，千分之一权重，左负右正 */
+static volatile uint8_t  line_valid;        /* 至少一路压线时为 1 */
+
+/* ---- 编码器与车速 ---- */
+static volatile int32_t enc_delta_l, enc_delta_r;
+static volatile float   speed_l, speed_r;   /* m/s */
+static int16_t  enc_hist_l[ENC_AVG_SAMPLES];
+static int16_t  enc_hist_r[ENC_AVG_SAMPLES];
+static uint8_t  enc_hist_idx;
+static int32_t  enc_sum_l, enc_sum_r;
+
+/* ---- 控制器状态 ---- */
+static float line_prev_err;    /* 上一拍偏差，用于差分 */
+static float line_d_lpf;       /* 偏差变化率低通状态 */
+static float speed_i_l, speed_i_r;  /* 每轮速度环积分（CCR 单位） */
+static float spd_ramp;         /* 目标速度斜坡状态 */
+static volatile float dbg_turn_mps;
+static volatile float dbg_err;
+static volatile int16_t dbg_ccr_l, dbg_ccr_r;
+
+/* ---- 运行状态 ---- */
+static volatile uint8_t run_on;       /* 1 = 发车 */
+static uint16_t run_ticks;
+static uint16_t lost_ticks;
+static uint16_t stall_ticks;
+static volatile uint8_t fault_code;   /* 0 无 / 1 堵转 */
+
+/* ---- 串口调参 ---- */
+static char tune_rx[TUNE_RX_BUF];
+static uint8_t tune_rx_len;
+static uint32_t tune_last_byte_tick;
+static uint8_t tune_enabled = 1U;
+
+/* ---- 小工具 ---- */
+static float Limit(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static float AbsF(float v)
+{
+  return (v < 0.0f) ? -v : v;
+}
+
+/* 多路复用器切换通道后要等 1 us，multiplexer_delay_us() 是用 DWT->CYCCNT 计时的。
+   DWT 不使能时 CYCCNT 恒为 0，那个 while 会死等，整个程序卡死。
+   原来是在 BMI270 的端口初始化里顺手开的，现在不用陀螺仪了，必须自己开。 */
+static void DwtCyccnt_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/* 按当前极性统计"压线"的路数。 */
+static uint16_t Line_ActiveCount(uint16_t bits)
+{
+  uint16_t n = 0U, ch;
+  for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
+  {
+    if (MUX_GET_CHANNEL(bits, ch) == LINE_ACTIVE_LEVEL) ++n;
+  }
+  return n;
+}
+
+/* 读 12 路光电管，算出加权平均偏差。
+   通道 0 在最左、权重 -6；通道 11 在最右、权重 +6；
+   所以偏差为负表示线在车体左侧。 */
+static void LineSensor_Update(void)
+{
+  uint16_t bits;
+  int32_t weighted = 0;
+  uint16_t n = 0U, ch;
+
+  MUX_get_value(&bits);
+  line_bits = bits;
+
+  for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
+  {
+    if (MUX_GET_CHANNEL(bits, ch) == LINE_ACTIVE_LEVEL)
+    {
+      int32_t w = (ch < 6U) ? ((int32_t)ch - 6L) : ((int32_t)ch - 5L);
+      weighted += w;
+      ++n;
+    }
+  }
+
+  if (n == 0U)
+  {
+    line_error_milli = 0;
+    line_valid = 0U;
+    return;
+  }
+
+  line_error_milli = (int16_t)((weighted * LINE_ERROR_SCALE) / (int32_t)n);
+  line_valid = 1U;
+}
+
+/* 10 ms 读一次编码器，30 ms 滑窗求平均车速。 */
+static void Encoder_UpdateSpeed(void)
+{
+  int16_t raw_l = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+  int16_t raw_r = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+
+  __HAL_TIM_SET_COUNTER(&htim3, 0U);
+  __HAL_TIM_SET_COUNTER(&htim4, 0U);
+
+  raw_l = (int16_t)(ENC_L_SIGN * raw_l);
+  raw_r = (int16_t)(ENC_R_SIGN * raw_r);
+
+  enc_delta_l = raw_l;
+  enc_delta_r = raw_r;
+
+  enc_sum_l += (int32_t)raw_l - enc_hist_l[enc_hist_idx];
+  enc_sum_r += (int32_t)raw_r - enc_hist_r[enc_hist_idx];
+  enc_hist_l[enc_hist_idx] = raw_l;
+  enc_hist_r[enc_hist_idx] = raw_r;
+
+  if (++enc_hist_idx >= ENC_AVG_SAMPLES) enc_hist_idx = 0U;
+
+  speed_l = ((float)enc_sum_l / ENC_COUNTS_PER_METER) /
+            ((float)(ENC_AVG_SAMPLES * CTRL_PERIOD_MS) / 1000.0f);
+  speed_r = ((float)enc_sum_r / ENC_COUNTS_PER_METER) /
+            ((float)(ENC_AVG_SAMPLES * CTRL_PERIOD_MS) / 1000.0f);
+}
+
+/* 发车键：PB14 低电平按下，每按一次在"待发车 / 运行中"之间切换。 */
+static void RunButton_Update(void)
+{
+  static uint8_t stable = 1U;
+  static uint8_t candidate = 1U;
+  static uint32_t candidate_since;
+  uint32_t now = HAL_GetTick();
+  uint8_t raw = (HAL_GPIO_ReadPin(GPIO_RUN_GPIO_Port, GPIO_RUN_Pin) == GPIO_PIN_RESET) ? 0U : 1U;
+
+  if (raw != candidate)
+  {
+    candidate = raw;
+    candidate_since = now;
+  }
+  else if ((candidate != stable) && ((now - candidate_since) >= 20U))
+  {
+    stable = candidate;
+    if (stable == 0U) /* 按下 */
+    {
+      run_on = (run_on != 0U) ? 0U : 1U;
+      fault_code = 0U;
+      run_ticks = 0U;
+      lost_ticks = 0U;
+      stall_ticks = 0U;
+      line_prev_err = 0.0f;
+      line_d_lpf = 0.0f;
+      speed_i_l = 0.0f;
+      speed_i_r = 0.0f;
+      spd_ramp = 0.0f;
+      dbg_turn_mps = 0.0f;
+      dbg_err = 0.0f;
+      TIM1->CCR1 = 0U;
+      TIM1->CCR2 = 0U;
+    }
+  }
+}
+
+/* 每 10 ms 调用一次：转向环 PD 算左右轮速度差，速度环 PI 把每轮拉到目标值。 */
+static void Control_Update(void)
+{
+  const float dt = CTRL_DT;
+  float err = 0.0f;         /* 偏差，正 = 线在车体右侧 */
+  float deriv;
+  float turn;               /* 转向量，m/s，正 = 右转 */
+  float v_target, t_l, t_r;
+  float ccr_l, ccr_r;
+
+  /* 未发车 / 故障：停机 */
+  if ((run_on == 0U) || (fault_code != 0U))
+  {
+    stall_ticks = 0U;
+    lost_ticks = 0U;
+    speed_i_l = 0.0f;
+    speed_i_r = 0.0f;
+    line_prev_err = 0.0f;
+    line_d_lpf = 0.0f;
+    spd_ramp = 0.0f;
+    dbg_turn_mps = 0.0f;
+    dbg_err = 0.0f;
+    TIM1->CCR1 = 0U;
+    TIM1->CCR2 = 0U;
+    return;
+  }
+
+  if (run_ticks < 0xFFFFU) ++run_ticks;
+
+  /* ---------- 偏差 ---------- */
+  if (line_valid == 0U)
+  {
+    if (lost_ticks < LINE_LOST_STOP_TICKS) ++lost_ticks;
+    if (lost_ticks >= LINE_LOST_STOP_TICKS)
+    {
+      /* 丢线超时：停车等待（不盲目往前冲） */
+      TIM1->CCR1 = 0U;
+      TIM1->CCR2 = 0U;
+      speed_i_l = 0.0f;
+      speed_i_r = 0.0f;
+      line_prev_err = 0.0f;
+      line_d_lpf = 0.0f;
+      spd_ramp = 0.0f;
+      dbg_turn_mps = 0.0f;
+      return;
+    }
+    /* 短暂丢线（十字路口 / 虚线 / 折角）：保持上一次偏差继续走几十毫秒 */
+    err = line_prev_err;
+    deriv = 0.0f;
+    line_d_lpf *= LINE_D_LPF_ALPHA;
+  }
+  else
+  {
+    err = tune_line_sign * ((float)line_error_milli / (float)LINE_ERROR_SCALE);
+    deriv = (err - line_prev_err) / dt;
+    lost_ticks = 0U;
+
+    /* 十字 / 宽黑区：压线太多时加权平均会塌到 0，车会直冲。
+       此时沿用上一次的方向，等真正回到单线再恢复。 */
+    if (Line_ActiveCount(line_bits) >= LINE_WIDE_ACTIVE_COUNT)
+    {
+      err = line_prev_err;
+      deriv = 0.0f;
+    }
+    line_prev_err = err;
+
+    /* 光电管是离散的，单步差分会有很大量化尖峰，这里再低通一次 */
+    line_d_lpf = (LINE_D_LPF_ALPHA * line_d_lpf) +
+                 ((1.0f - LINE_D_LPF_ALPHA) * deriv);
+  }
+  dbg_err = err;
+
+  /* ---------- 转向环：PD -> 左右轮速度差 ---------- */
+  turn = (tune_line_kp * err) + (tune_line_kd * line_d_lpf);
+  turn = Limit(turn, -tune_turn_lim, tune_turn_lim);
+  dbg_turn_mps = turn;
+
+  /* ---------- 目标速度走斜坡，避免发车瞬间满油门打滑 ---------- */
+  if (spd_ramp < tune_target)
+  {
+    spd_ramp += SPEED_ACCEL_MPS2 * dt;
+    if (spd_ramp > tune_target) spd_ramp = tune_target;
+  }
+  else if (spd_ramp > tune_target)
+  {
+    spd_ramp -= SPEED_ACCEL_MPS2 * dt;
+    if (spd_ramp < tune_target) spd_ramp = tune_target;
+  }
+
+  v_target = spd_ramp;
+
+  /* turn > 0 表示右转：左轮加速、右轮减速 */
+  t_l = Limit(v_target + turn, 0.0f, SPEED_LIMIT_MPS);
+  t_r = Limit(v_target - turn, 0.0f, SPEED_LIMIT_MPS);
+
+  /* ---------- 速度环：每轮独立 PI，输出直接是 CCR ---------- */
+  {
+    float e_l = t_l - speed_l;
+    float e_r = t_r - speed_r;
+    float ff_l = tune_ccr_zero + (tune_ccr_per_mp * t_l);
+    float ff_r = tune_ccr_zero + (tune_ccr_per_mp * t_r);
+
+    speed_i_l = Limit(speed_i_l + (e_l * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+    speed_i_r = Limit(speed_i_r + (e_r * dt), -SPEED_I_LIMIT_CCR, SPEED_I_LIMIT_CCR);
+
+    ccr_l = ff_l + (tune_speed_kp * e_l) + (tune_speed_ki * speed_i_l);
+    ccr_r = ff_r + (tune_speed_kp * e_r) + (tune_speed_ki * speed_i_r);
+
+    /* 目标速度为 0 的那一轮必须真的停，不能因为前馈/积分还在推而空转 */
+    if (t_l <= 0.0f) { ccr_l = 0.0f; speed_i_l = 0.0f; }
+    if (t_r <= 0.0f) { ccr_r = 0.0f; speed_i_r = 0.0f; }
+
+    ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
+    ccr_r = Limit(ccr_r, 0.0f, tune_ccr_max);
+  }
+
+  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+  TIM1->CCR1 = (uint16_t)ccr_l;
+  TIM1->CCR2 = (uint16_t)ccr_r;
+  dbg_ccr_l = (int16_t)ccr_l;
+  dbg_ccr_r = (int16_t)ccr_r;
+
+  /* ---------- 堵转 / 编码器方向反转保护 ---------- */
+  /* 两个轮子都只会被命令正转（DIR 脚固定），所以实测出现明显负速度
+     就说明编码器符号或方向脚接反了。这种情况会让速度环正反馈、越跑越快，
+     必须立刻停机，不能等它冲出去。 */
+  {
+    uint8_t bad_sign = 0U;
+
+    if ((ccr_l >= STALL_CCR_MIN) && (speed_l < -STALL_SPEED_MPS)) bad_sign = 1U;
+    if ((ccr_r >= STALL_CCR_MIN) && (speed_r < -STALL_SPEED_MPS)) bad_sign = 1U;
+
+    if ((run_ticks > RUN_GRACE_TICKS) &&
+        (bad_sign ||
+         (((ccr_l >= STALL_CCR_MIN) || (ccr_r >= STALL_CCR_MIN)) &&
+          (AbsF((speed_l + speed_r) * 0.5f) < STALL_SPEED_MPS))))
+    {
+      if (stall_ticks < 0xFFFFU) ++stall_ticks;
+      if (stall_ticks >= STALL_TICKS)
+      {
+        fault_code = 1U;
+        TIM1->CCR1 = 0U;
+        TIM1->CCR2 = 0U;
+      }
+    }
+    else
+    {
+      stall_ticks = 0U;
+    }
+  }
+}
+
+/* ---- 串口在线调参：形如 lkp=0.1 / spd=0.4 / l=-1 / show ----
+   串口助手不发换行也可以，按 120 ms 空闲收尾。 */
+static void Tune_Apply(const char *name, uint8_t len, float v)
+{
+  char nm[8];
+  uint8_t i;
+
+  if (len >= sizeof(nm)) { printf("err,name\r\n"); return; }
+  for (i = 0U; i < len; ++i) nm[i] = name[i];
+  nm[len] = '\0';
+
+  if      ((len == 3U) && (nm[0]=='l') && (nm[1]=='k') && (nm[2]=='p')) tune_line_kp   = v;
+  else if ((len == 3U) && (nm[0]=='l') && (nm[1]=='k') && (nm[2]=='d')) tune_line_kd   = v;
+  else if ((len == 3U) && (nm[0]=='s') && (nm[1]=='k') && (nm[2]=='p')) tune_speed_kp   = v;
+  else if ((len == 3U) && (nm[0]=='s') && (nm[1]=='k') && (nm[2]=='i')) tune_speed_ki   = v;
+  else if ((len == 3U) && (nm[0]=='s') && (nm[1]=='p') && (nm[2]=='d')) tune_target     = v;
+  else if ((len == 3U) && (nm[0]=='t') && (nm[1]=='l') && (nm[2]=='m')) tune_turn_lim   = v;
+  else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='z')) tune_ccr_zero    = v;
+  else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='p')) tune_ccr_per_mp  = v;
+  else if ((len == 2U) && (nm[0]=='c') && (nm[1]=='x')) tune_ccr_max     = v;
+  else if ((len == 1U) && (nm[0]=='l')) tune_line_sign = (v < 0.0f) ? -1.0f : 1.0f;
+  else { printf("err,name\r\n"); return; }
+
+  /* 兜一层限幅，防止手误把参数输成离谱的值后车子失控 */
+  tune_line_kp   = Limit(tune_line_kp, 0.0f, 1.0f);
+  tune_line_kd   = Limit(tune_line_kd, 0.0f, 0.05f);
+  tune_speed_kp  = Limit(tune_speed_kp, 0.0f, 2000.0f);
+  tune_speed_ki  = Limit(tune_speed_ki, 0.0f, 10000.0f);
+  tune_target    = Limit(tune_target, 0.0f, SPEED_LIMIT_MPS);
+  tune_turn_lim  = Limit(tune_turn_lim, 0.0f, SPEED_LIMIT_MPS);
+  tune_ccr_zero  = Limit(tune_ccr_zero, 0.0f, 7199.0f);
+  tune_ccr_per_mp = Limit(tune_ccr_per_mp, 0.0f, 20000.0f);
+  tune_ccr_max   = Limit(tune_ccr_max, 0.0f, 7199.0f);
+
+  printf("set,%s,%ld\r\n", nm, (long)(v * 1000.0f));
+}
+
+static void Tune_Print(void)
+{
+  printf("cfg,lkp=%ld,lkd=%ld,spd=%ld,tlm=%ld,skp=%ld,ski=%ld,cz=%ld,cp=%ld,cx=%ld,l=%ld\r\n",
+         (long)(tune_line_kp * 1000.0f),
+         (long)(tune_line_kd * 10000.0f),
+         (long)(tune_target * 1000.0f),
+         (long)(tune_turn_lim * 1000.0f),
+         (long)tune_speed_kp,
+         (long)tune_speed_ki,
+         (long)tune_ccr_zero,
+         (long)tune_ccr_per_mp,
+         (long)tune_ccr_max,
+         (long)tune_line_sign);
+}
+
+static void Tune_Execute(char *s, uint8_t len)
+{
+  uint8_t i = 0U, nl = 0U, k;
+  float ipart = 0.0f, fpart = 0.0f, fdiv = 0.1f;
+  uint8_t neg = 0U, digits = 0U, dot = 0U;
+
+  while ((i < len) && ((s[i] == ' ') || (s[i] == '\t'))) ++i;
+  while ((len > i) && ((s[len-1] == ' ') || (s[len-1] == '\t') || (s[len-1] == '\r'))) --len;
+  if (len <= i) return;
+
+  if (((len - i) == 4U) && (s[i]=='s') && (s[i+1]=='h') && (s[i+2]=='o') && (s[i+3]=='w'))
+  {
+    Tune_Print();
+    return;
+  }
+
+  while (((i + nl) < len) && (s[i+nl] != '=') && (s[i+nl] != ' ')) ++nl;
+  if (nl == 0U) { printf("err,name\r\n"); return; }
+
+  k = (uint8_t)(i + nl);
+  while ((k < len) && ((s[k] == '=') || (s[k] == ' '))) ++k;
+
+  for (; k < len; ++k)
+  {
+    char c = s[k];
+    if (c == '-') { neg = 1U; }
+    else if (c == '.') { dot = 1U; }
+    else if ((c >= '0') && (c <= '9'))
+    {
+      if (dot == 0U)
+      {
+        ipart = (ipart * 10.0f) + (float)(c - '0');
+      }
+      else
+      {
+        fpart += fdiv * (float)(c - '0');
+        fdiv *= 0.1f;
+      }
+      ++digits;
+    }
+  }
+  if (digits == 0U) { printf("err,value\r\n"); return; }
+
+  {
+    float v = ipart + fpart;
+    if (neg) v = -v;
+    Tune_Apply(&s[i], nl, v);
+  }
+}
+
+static void Tune_Service(uint32_t now)
+{
+  if (tune_rx_len == 0U) return;
+  if ((now - tune_last_byte_tick) < TUNE_LINE_IDLE_MS) return;
+
+  tune_rx[tune_rx_len] = '\0';
+  Tune_Execute(tune_rx, tune_rx_len);
+  tune_rx_len = 0U;
+}
+
+/* 串口收到的每个字节先进缓冲区，按 120 ms 空闲判定一行结束。 */
+static uint8_t uart_rx_byte;
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    char c = (char)uart_rx_byte;
+
+    if ((c == '\n') || (c == '\r'))
+    {
+      if (tune_rx_len > 0U)
+      {
+        tune_rx[tune_rx_len] = '\0';
+        Tune_Execute(tune_rx, tune_rx_len);
+        tune_rx_len = 0U;
+      }
+    }
+    else if (tune_rx_len < (TUNE_RX_BUF - 1U))
+    {
+      tune_rx[tune_rx_len++] = c;
+      tune_last_byte_tick = HAL_GetTick();
+    }
+    (void)HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1U);
+  }
+}
+
+/* TIM2 是 1 kHz 时基，分频到 10 ms 作为控制周期。 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  static uint16_t divider;
+
+  if (htim->Instance != TIM2) return;
+
+  if (++divider < CTRL_PERIOD_MS) return;
+  divider = 0U;
+
+  Encoder_UpdateSpeed();
+  Control_Update();
+}
+
+
 /* USER CODE END 0 */
 void Init_brushless_motor(void)
 {
@@ -218,36 +800,67 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   Init_brushless_motor(); //等待无刷电调负压启动完成
   /* USER CODE BEGIN 2 */
-  dodo_BMI270_init(); // 初始化陀螺仪
-  //pwm示例
-  //TIM1->CCR1 = 2000;
-  //TIM1->CCR2 = 2000;
-  // 延时5000秒，等待无刷电调初始化
-  // TIM1->PSC = 0;
+  /* 编码器：TIM3 = 左轮，TIM4 = 右轮，正交计数 */
+  if (HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK) Error_Handler();
+  if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK) Error_Handler();
 
+  /* 光电管读取依赖 DWT 计时，必须最先打开 */
+  DwtCyccnt_Init();
+
+  /* 1 kHz 时基：控制周期由 HAL_TIM_PeriodElapsedCallback 分频到 10 ms */
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) Error_Handler();
+
+  /* 串口接收中断，用于在线调参 */
+  if (tune_enabled) (void)HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1U);
+
+  /* 电机先确保停止 */
+  TIM1->CCR1 = 0U;
+  TIM1->CCR2 = 0U;
+  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+
+  printf("ready,line_follow\r\n");
+  Tune_Print();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // 以下为陀螺仪使用示例
-    dodo_BMI270_get_data();                         // 调用此函数会更新陀螺仪数据
-    gyro_x = BMI270_gyro_transition(BMI270_gyro_x); // 将原始陀螺仪数据转换为物理值，单位为度每秒
-    gyro_y = BMI270_gyro_transition(BMI270_gyro_y);
-    gyro_z = BMI270_gyro_transition(BMI270_gyro_z);
-    accel_x = BMI270_acc_transition(BMI270_accel_x); // 将原始加速度计数据转换为物理值，单位为g，一般不需要使用此数据
-    accel_y = BMI270_acc_transition(BMI270_accel_y);
-    accel_z = BMI270_acc_transition(BMI270_accel_z);
-    if (GYRO_DEBUG)
-      printf("%f,%f,%f,%f,%f,%f\r\n",gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z);
-    // 以下为读取光电管的示例（从左到右编号0~11）
-    //  uint16_t mux_value;
-    //  MUX_get_value(&mux_value);
-    //  for(int i=0;i<=11;i++){
-    //    printf("%d,",MUX_GET_CHANNEL(mux_value,i));//获取第i个光电管的数值并输出
-    //  }
-    //  printf("\n");
+    uint32_t now = HAL_GetTick();
+
+    /* 光电管与发车键 */
+    {
+      static uint32_t line_tick;
+      if ((now - line_tick) >= LINE_SAMPLE_MS)
+      {
+        line_tick = now;
+        LineSensor_Update();
+      }
+    }
+    RunButton_Update();
+    Tune_Service(now);
+
+    /* 周期性打印，便于用串口助手观察 */
+    {
+      static uint32_t print_tick;
+      if ((now - print_tick) >= TUNE_PRINT_MS)
+      {
+        print_tick = now;
+        printf("st,%u,%u,%u,%04X,%d,%ld,%ld,%ld,%ld,%d,%d\r\n",
+               (unsigned int)run_on,
+               (unsigned int)line_valid,
+               (unsigned int)fault_code,
+               (unsigned int)line_bits,
+               (int)line_error_milli,               /* 偏差，千分之一权重 */
+               (long)(dbg_err * 1000.0f),           /* 参与控制的偏差 ×1000 */
+               (long)(dbg_turn_mps * 1000.0f),      /* 转向量 mm/s，正 = 右转 */
+               (long)(speed_l * 1000.0f),           /* 左轮实测 mm/s */
+               (long)(speed_r * 1000.0f),           /* 右轮实测 mm/s */
+               (int)dbg_ccr_l,
+               (int)dbg_ccr_r);
+      }
+    }
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }
@@ -447,7 +1060,11 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
-
+  /* 使能 TIM2 更新中断：控制周期就是在这个中断里产生的。
+     CubeMX 没有勾选 NVIC，必须在这里补上，否则 HAL_TIM_PeriodElapsedCallback
+     永远不会被调用，控制环等于不存在。 */
+  HAL_NVIC_SetPriority(TIM2_IRQn, 0U, 0U);
+  HAL_NVIC_EnableIRQ(TIM2_IRQn);
   /* USER CODE END TIM2_Init 2 */
 }
 
@@ -575,7 +1192,10 @@ static void MX_USART3_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART3_Init 2 */
-
+  /* 使能 USART3 中断：串口调参依赖 HAL_UART_Receive_IT。
+     CubeMX 未勾选 NVIC，同样必须在这里补上。 */
+  HAL_NVIC_SetPriority(USART3_IRQn, 1U, 0U);
+  HAL_NVIC_EnableIRQ(USART3_IRQn);
   /* USER CODE END USART3_Init 2 */
 }
 
