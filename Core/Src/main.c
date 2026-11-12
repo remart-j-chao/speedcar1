@@ -171,8 +171,9 @@
    ========================================================================== */
 #define TASK_LINE               1U
 #define TASK_ROTATE             2U
-/* 上电默认跑哪个任务：串口发 m=1 / m=2 可以在线切回来 */
-#define TASK_SELECT             TASK_ROTATE
+#define TASK_STRAIGHT           3U
+/* 上电默认跑哪个任务：串口发 m=1 / m=2 / m=3 可以在线切 */
+#define TASK_SELECT             TASK_STRAIGHT
 
 #define ROT_STEP_DEG            90.0f    /* 每一步转多少度 */
 #define ROT_STEPS               4U       /* 一共几步（4 × 90 = 一圈） */
@@ -189,6 +190,18 @@
 #define ROT_STATE_TURN          1U
 #define ROT_STATE_HOLD          2U
 #define ROT_STATE_DONE          3U
+
+/* ==========================================================================
+   任务三：沿直线行走 1 m（编码器里程计 + 两轮行程差保持直线）
+   --------------------------------------------------------------------------
+   距离 = (左轮累计计数 + 右轮累计计数) / 2 / 每米计数。
+   直线保持不用陀螺仪，改用两轮的**累计行程差**：
+   左右累计行程一旦不等，说明车头已经偏了，直接把这个差值当作
+   转角偏差去纠，符号天然正确（ENC_L_SIGN / ENC_R_SIGN 任务一已验证）。
+   ========================================================================== */
+#define STRAIGHT_DIST_M         1.00f    /* 目标距离，米 */
+#define STRAIGHT_KP             2.0f     /* (m/s) 每米行程差，直线纠正强度 */
+#define STRAIGHT_TURN_LIM     0.15f    /* 纠正量限幅，只在"保持直线"范围内用 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -393,6 +406,11 @@ static uint16_t gyro_bias_cnt;
 static uint32_t gyro_bias_tick;
 static uint8_t  gyro_bias_ok;
 
+/* ---- 任务三：直线行走 ---- */
+static volatile float tune_straight_dist = STRAIGHT_DIST_M;
+static volatile int32_t odom_l, odom_r;     /* 左右轮累计计数 */
+static volatile uint8_t straight_done;
+
 /* ---- 小工具 ---- */
 static float Limit(float v, float lo, float hi)
 {
@@ -563,6 +581,10 @@ static void Encoder_UpdateSpeed(void)
 
   if (++enc_hist_idx >= ENC_AVG_SAMPLES) enc_hist_idx = 0U;
 
+  /* 里程计：任务三用它算走过的距离 */
+  odom_l += (int32_t)raw_l;
+  odom_r += (int32_t)raw_r;
+
   speed_l = ((float)enc_sum_l / ENC_COUNTS_PER_METER) /
             ((float)(ENC_AVG_SAMPLES * CTRL_PERIOD_MS) / 1000.0f);
   speed_r = ((float)enc_sum_r / ENC_COUNTS_PER_METER) /
@@ -681,6 +703,14 @@ static void RunButton_Update(void)
         dbg_err = 0.0f;
         TIM1->CCR1 = 0U;
         TIM1->CCR2 = 0U;
+
+        /* 任务三：每次按下都把里程清零，重新走 1 m */
+        if (task_mode == TASK_STRAIGHT)
+        {
+          odom_l = 0;
+          odom_r = 0;
+          straight_done = (run_on != 0U) ? 0U : 1U;
+        }
       }
     }
   }
@@ -767,6 +797,38 @@ static void Control_Update(void)
         turn = 0.0f;
         break;
     }
+    dbg_turn_mps = turn;
+    goto speed_loop;
+  }
+
+  /* ================= 任务三：沿直线行走 STRAIGHT_DIST_M ================= */
+  if (task_mode == TASK_STRAIGHT)
+  {
+    float dist = ((float)(odom_l + odom_r) * 0.5f) / ENC_COUNTS_PER_METER;
+    float wrong;
+
+    if ((straight_done != 0U) || (dist >= tune_straight_dist))
+    {
+      straight_done = 1U;
+      v_target = 0.0f;
+      turn = 0.0f;
+    }
+    else
+    {
+      /* 起步走斜坡，避免打滑让里程计多算 */
+      if (spd_ramp < tune_target)
+      {
+        spd_ramp += SPEED_ACCEL_MPS2 * dt;
+        if (spd_ramp > tune_target) spd_ramp = tune_target;
+      }
+      v_target = spd_ramp;
+
+      /* 两轮累计行程差 -> 车头偏差。左轮走得多说明车偏右了，要往左纠。 */
+      wrong = ((float)(odom_l - odom_r)) / ENC_COUNTS_PER_METER;
+      turn = Limit(-STRAIGHT_KP * wrong, -STRAIGHT_TURN_LIM, STRAIGHT_TURN_LIM);
+    }
+
+    dbg_err = dist;               /* 复用打印字段显示距离 */
     dbg_turn_mps = turn;
     goto speed_loop;
   }
@@ -1014,15 +1076,19 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   else if ((len == 2U) && (nm[0]=='s') && (nm[1]=='a')) tune_rot_ahead   = v;
   else if ((len == 2U) && (nm[0]=='r') && (nm[1]=='p')) tune_rot_speed   = v;
   else if ((len == 2U) && (nm[0]=='r') && (nm[1]=='d')) tune_rot_dir     = (v < 0.0f) ? -1.0f : 1.0f;
+  else if ((len == 2U) && (nm[0]=='s') && (nm[1]=='d')) tune_straight_dist = v;
   else if ((len == 1U) && (nm[0]=='m'))
   {
-    uint8_t m = (v < 1.5f) ? TASK_LINE : TASK_ROTATE;
+    uint8_t m = (v < 1.5f) ? TASK_LINE : ((v < 2.5f) ? TASK_ROTATE : TASK_STRAIGHT);
 
     if (m != task_mode)
     {
       task_mode = m;
       run_on = 0U;
       rot_state = ROT_STATE_IDLE;
+      straight_done = 0U;
+      odom_l = 0;
+      odom_r = 0;
       TIM1->CCR1 = 0U;
       TIM1->CCR2 = 0U;
       if (m == TASK_ROTATE) GyroBias_Reset();
@@ -1046,6 +1112,7 @@ static void Tune_Apply(const char *name, uint8_t len, float v)
   tune_hold_ccr  = Limit(tune_hold_ccr, 0.0f, 7199.0f);
   tune_rot_ahead = Limit(tune_rot_ahead, 0.0f, 45.0f);
   tune_rot_speed = Limit(tune_rot_speed, 0.05f, 0.60f);
+  tune_straight_dist = Limit(tune_straight_dist, 0.05f, 5.00f);
 
   printf("set,%s,%ld\r\n", nm, (long)(v * 1000.0f));
 }
@@ -1065,11 +1132,12 @@ static void Tune_Print(void)
          (long)tune_ccr_max,
          (long)tune_hold_ccr,
          (long)tune_line_sign);
-  printf("cfg2,m=%u,rd=%ld,rp=%ld,sa=%ld,l=%ld\r\n",
+  printf("cfg2,m=%u,rd=%ld,rp=%ld,sa=%ld,sd=%ld,l=%ld\r\n",
          (unsigned)task_mode,
          (long)tune_rot_dir,
          (long)(tune_rot_speed * 1000.0f),
          (long)(tune_rot_ahead * 10.0f),
+         (long)(tune_straight_dist * 1000.0f),
          (long)tune_line_sign);
 }
 
@@ -1270,7 +1338,8 @@ int main(void)
   HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
   HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
 
-  printf("ready,%s\r\n", (task_mode == TASK_ROTATE) ? "rotate_4x90" : "line_follow");
+  printf("ready,%s\r\n", (task_mode == TASK_ROTATE) ? "rotate_4x90" :
+                         ((task_mode == TASK_STRAIGHT) ? "straight_1m" : "line_follow"));
   Tune_Print();
   /* USER CODE END 2 */
 
@@ -1342,6 +1411,18 @@ int main(void)
                  (long)(rot_yaw_deg * 10.0f),
                  (long)(gyro_gz * 10.0f),
                  (long)(rot_target_deg * 10.0f),
+                 (int)dbg_ccr_l,
+                 (int)dbg_ccr_r);
+        }
+        else if (task_mode == TASK_STRAIGHT)
+        {
+          /* str,run,完成,距离mm,左右累计计数,ccrL,ccrR */
+          printf("str,%u,%u,%ld,%ld,%ld,%d,%d\r\n",
+                 (unsigned int)run_on,
+                 (unsigned int)straight_done,
+                 (long)(((float)(odom_l + odom_r) * 0.5f) / ENC_COUNTS_PER_METER * 1000.0f),
+                 (long)odom_l,
+                 (long)odom_r,
                  (int)dbg_ccr_l,
                  (int)dbg_ccr_r);
         }
