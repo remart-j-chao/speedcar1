@@ -281,10 +281,12 @@ static volatile uint16_t fault_ccr_r;
    解决办法是不靠光电管，直接用陀螺仪积分出来的航向角闭环转过固定角度。 */
 /* 目标转角（度）。85~90 之间；设 0 可整体关闭该功能。 */
 #define CORNER_TURN_DEG            88.0f
-/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 4 路。
-   4000 是 3500（太灵敏、会误触发）与 4500（太迟钝）之间的折中值。 */
-#define CORNER_DETECT_ERR          4000
-#define CORNER_DETECT_MAX_ACTIVE   4U
+/* 触发条件：偏差绝对值超过该值（千分之一权重）且同时压线路数不超过 3 路，
+   即"最外侧两三路压线、内侧全脱"——这是直角弯的典型特征。
+   4500 是实测验证过的值：日志里 corner,start,-325 -> corner,done,241 就是这个配置下产生的。
+   改成 3500 会导致普通弯道误触发、强制转 88 度而实际只需要 40 度，反而过不去。 */
+#define CORNER_DETECT_ERR          4500
+#define CORNER_DETECT_MAX_ACTIVE   3U
 /* 连续满足多少个控制周期才认账，避免单帧误触发。 */
 #define CORNER_DETECT_TICKS        2U
 /* 角度到位判据（度）与超时保护。 */
@@ -299,9 +301,10 @@ static volatile uint16_t fault_ccr_r;
    Z 字弯的两个折角间隔很短，冷却太长会漏掉第二个折角，故取 150 ms。 */
 #define CORNER_COOLDOWN_MS         150U
 /* 直角弯转角阶段的车速比例（相对基本速）。
-   1.0 = 与基本速相同。不要低于 0.9：太慢会变成原地打转、外侧轮顶到差速上限；
-   也不要高于 1.3：太快会让 88 度的转角画出很大的弧线而切出赛道。 */
-#define CORNER_SPEED_SCALE         1.00f
+   0.80 是实测验证过的值：日志里那次成功转角（yaw 冲到 202 dps、
+   diff 打满 0.70、ang 从 −32.5 走到 +24.1）就是在这个比例下产生的。
+   调高到 1.15 会让 88 度转角画出很大的弧线而切出赛道。 */
+#define CORNER_SPEED_SCALE         0.80f
 #define CORNER_COOLDOWN_TICKS      (CORNER_COOLDOWN_MS / CONTROL_UPDATE_MS)
 /* 反转自检窗口：目标为负、实测仍向前超过 400 ms 即判定方向脚没生效。 */
 #define REV_CHECK_MS               400U
