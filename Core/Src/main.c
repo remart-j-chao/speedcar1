@@ -144,8 +144,8 @@
    停车是最后手段：比赛里车一旦停住，这一圈就废了，直行搜索远比停车好。 */
 #define LINE_LOST_SEARCH_MS        1200U
 #define LINE_LOST_SEARCH_TICKS     ((LINE_LOST_HOLD_MS + LINE_LOST_SEARCH_MS) / CONTROL_UPDATE_MS)
-/* 直行搜索时的车速比例，别跑太远。 */
-#define LINE_SEARCH_SPEED_SCALE    0.70f
+/* 直行搜索时的车速比例：直接用全速，低速时轮子会掉进死区开始抖。 */
+#define LINE_SEARCH_SPEED_SCALE    1.00f
 
 /* 发车后目标速度的爬升率，避免目标速度阶跃造成打滑和电流冲击。 */
 #define CONTROL_ACCEL_LIMIT_MPS2   1.0f
@@ -250,14 +250,13 @@ static volatile uint16_t fault_ccr_r;
 #define YAW_RATE_DAMP              0.05f
 /* 角速度微分的限幅（dps/s），防止噪声或跳变把阻尼项打爆。 */
 #define YAW_RATE_DERIV_LIMIT       6000.0f
-#define SPEED_PI_KP                200.0f  /* 基础 PWM / 速度误差。
-                                              实测对象增益约 0.0037 m/s per PWM，
-                                              Kp=500 时速度环增益 1.85，配合 30 ms 滑窗会
-                                              在"内轮目标被压到 0.13 m/s"时打成 0↔356 的
-                                              bang-bang（日志里 left 列反复出现 0 就是这个）。
-                                              降到 200 后增益 0.74，内轮能稳稳停在低速，
-                                              差速上限从 0.20 提到约 0.30 m/s，
-                                              最小转弯半径从 0.27 降到 0.18 m。 */
+#define SPEED_PI_KP                100.0f  /* 基础 PWM / 速度误差。
+                                              实测 CCR 317~330 对应 0.35~0.42 m/s，
+                                              即约 0.0054 m/s 每 CCR、0.0097 m/s 每 PWM。
+                                              Kp=200 时速度环增益约 1.94，配合 30 ms 滑窗
+                                              会在低目标速度下打成 0↔330 的开关，
+                                              日志里搜索阶段两轮交替滑行就是这么来的。
+                                              降到 100 后增益约 0.97，能稳住。 */
 #define SPEED_PI_KI                60.0f   /* 基础 PWM / 速度误差积分。
                                               为 0 时靠 P 撑不住稳态必抖；过大则撞墙时积分瞬间触限，
                                               脱困瞬间猛窜（实测 0.8 s 从 120 涨到 520，故取 60）。 */
@@ -1889,6 +1888,20 @@ static void VehicleControl_Update(void)
       -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   speed_right_state.previous_error = speed_error_right;
   speed_right_state.initialized = 1U;
+
+  /* 直行搜索：两轮强制用同一个 PWM，并把速度积分清零。
+     实测日志里搜索阶段两轮交替掉到 CCR=0（滑行）而另一轮仍在出力，
+     车就一边"直行搜索"一边自己转向，越搜越偏。
+     搜索阶段根本不需要差速，两轮同油门才能走直。 */
+  if (line_searching != 0U)
+  {
+    float mean_pwm = (base_left_pwm + base_right_pwm) * 0.5f;
+
+    base_left_pwm = mean_pwm;
+    base_right_pwm = mean_pwm;
+    speed_left_state.integral = 0.0f;
+    speed_right_state.integral = 0.0f;
+  }
 
   /* 调试量：base 仍输出左右平均，便于和旧打印格式对照。 */
   control_base_pwm = (base_left_pwm + base_right_pwm) * 0.5f;
