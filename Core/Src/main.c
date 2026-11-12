@@ -85,9 +85,15 @@
 /* 控制器只在完成实车标定后启用；0 表示不向电机 PWM 写入控制量。 */
 #define MOTOR_CONTROL_ENABLE       1U
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
-/* 速度环目标，比赛起始值。0.5 m/s 是"能稳定跑完整圈"的保守速度，
-   熟练后再用 spd=0.6 / 0.7 在线提速。若为 0，车不会动。 */
-#define CONTROL_TARGET_SPEED_MPS   0.60f
+/* 速度环目标，比赛起始值。
+   0.45 m/s 是按实测转弯能力反推出来的：本车可用的轮速区间只有 0.37~0.87 m/s，
+   差速最多 0.20~0.23 m/s，对应角速度上限约 126~145 dps。
+   最小转弯半径 = 车速 / 角速度，所以车速越低能转的弯越急：
+     0.60 m/s -> 0.27 m（实测正是这个值，弯道冲出去）
+     0.45 m/s -> 0.20 m
+     0.40 m/s -> 0.18 m
+   熟练后再用 spd=0.5 / 0.6 在线提速，但要先确认赛道弯道半径够大。 */
+#define CONTROL_TARGET_SPEED_MPS   0.45f
 #define CONTROL_MAX_PWM_CCR        700.0f
 /* 目标角速度上限。这条是最容易被忽略的"隐形天花板"：
    lkp=35、误差 6 时目标是 210 dps，超过 180 就被削平，
@@ -187,7 +193,14 @@ static volatile uint16_t fault_ccr_r;
                                             "能前进但不打舵"多半就是它。 */
 #define YAW_PID_KI                 0.0f  /* 差速 PWM / 角速度误差积分 */
 #define YAW_PID_KD                 0.0f  /* 差速 PWM / 角速度误差变化率 */
-#define SPEED_PI_KP                500.0f  /* 基础 PWM / 速度误差 */
+#define SPEED_PI_KP                200.0f  /* 基础 PWM / 速度误差。
+                                              实测对象增益约 0.0037 m/s per PWM，
+                                              Kp=500 时速度环增益 1.85，配合 30 ms 滑窗会
+                                              在"内轮目标被压到 0.13 m/s"时打成 0↔356 的
+                                              bang-bang（日志里 left 列反复出现 0 就是这个）。
+                                              降到 200 后增益 0.74，内轮能稳稳停在低速，
+                                              差速上限从 0.20 提到约 0.30 m/s，
+                                              最小转弯半径从 0.27 降到 0.18 m。 */
 #define SPEED_PI_KI                60.0f   /* 基础 PWM / 速度误差积分。
                                               为 0 时靠 P 撑不住稳态必抖；过大则撞墙时积分瞬间触限，
                                               脱困瞬间猛窜（实测 0.8 s 从 120 涨到 520，故取 60）。 */
