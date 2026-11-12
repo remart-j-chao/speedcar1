@@ -210,8 +210,11 @@ static volatile uint16_t fault_ccr_r;
 /* 偏差超过该值开始降速，到第二个值降到最低比例。 */
 #define CORNER_SLOW_ERR_START      2.0f
 #define CORNER_SLOW_ERR_FULL       4.5f
-/* 降速后的车速比例（0.55 表示剩 55%）。 */
-#define CORNER_SLOW_MIN_SCALE      0.55f
+/* 降速后的车速比例（0.65 表示剩 65%，即 0.35 → 0.23 m/s）。
+   不能再低了：0.19 m/s 时轮子已经贴着死区，速度环会开始一顿一顿。 */
+#define CORNER_SLOW_MIN_SCALE      0.65f
+/* 目标速度的绝对下限，保证轮子始终离死区有余量。 */
+#define CONTROL_SPEED_MIN_MPS      0.20f
 /* 减速比加速更急：加速 1 m/s²，减速 4 m/s²，否则进弯前来不及降下来。 */
 #define CONTROL_DECEL_LIMIT_MPS2   4.0f
 /* 循迹误差方向：1 = 误差为正时向左转，-1 = 向右转。
@@ -289,9 +292,13 @@ static volatile uint16_t fault_ccr_r;
 /* 角度环 P 增益（dps 每度）。90° 偏差时给 720 dps，会被限幅到 300，
    接近目标时自然减速；配合内层角速度环属于串级，不会有明显超调。 */
 #define CORNER_ANGLE_KP            8.0f
-/* 退出后冷却时间，防止刚上线又被同一个弯重复触发。 */
-#define CORNER_COOLDOWN_MS         400U
+/* 退出后冷却时间，防止刚上线又被同一个弯重复触发。
+   Z 字弯的两个折角间隔很短，冷却太长会漏掉第二个折角，故取 150 ms。 */
+#define CORNER_COOLDOWN_MS         150U
 #define CORNER_COOLDOWN_TICKS      (CORNER_COOLDOWN_MS / CONTROL_UPDATE_MS)
+/* 反转自检窗口：目标为负、实测仍向前超过 400 ms 即判定方向脚没生效。 */
+#define REV_CHECK_MS               400U
+#define REV_CHECK_TICKS            (REV_CHECK_MS / CONTROL_UPDATE_MS)
 
 /* 单次差速偏置上限，防止饱和打转。
    允许内轮反转后差速可以做到 0.70：spd=0.45、差速 0.61 时
@@ -543,6 +550,9 @@ static float yaw_prev_rate;
 static float yaw_rate_derivative;
 /* Z 字弯检测用的上一拍偏差（判断是否发生了左右翻转）。 */
 static int16_t prev_line_error_milli;
+/* 内轮反转自检：目标为负但实测仍向前跑满 REV_CHECK_MS 就打一次标记。 */
+static volatile uint8_t rev_fail_flag;
+static uint16_t rev_check_ticks;
 static volatile float tune_target_speed = CONTROL_TARGET_SPEED_MPS;
 static volatile float tune_deadzone_l   = MOTOR_DEADZONE_L;
 static volatile float tune_deadzone_r   = MOTOR_DEADZONE_R;
@@ -1770,6 +1780,9 @@ static void VehicleControl_Update(void)
                 (CORNER_SLOW_ERR_FULL - CORNER_SLOW_ERR_START);
       speed_target *= 1.0f - (t * (1.0f - CORNER_SLOW_MIN_SCALE));
     }
+    /* 绝对下限：轮子贴死区时速度环会抖，宁可少降一点也不降进死区。 */
+    if (speed_target < CONTROL_SPEED_MIN_MPS)
+      speed_target = CONTROL_SPEED_MIN_MPS;
 
     if (control_speed_target_mps < speed_target)
     {
@@ -1813,6 +1826,22 @@ static void VehicleControl_Update(void)
                                      -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
 
   speed_error_left = speed_target_left - speed_left_mps;
+  /* 反转自检：目标速度已经是负值（要求倒转），实测却仍在向前跑，
+     说明 DIR 方向脚没有真正换向（接线/电平/驱动芯片问题）。
+     此时"内轮反转"不但无效，还会让差速被吃掉一半，Z 字弯必然转不过。
+     连续 400 ms 满足就报一次，主循环里打印。 */
+  if ((speed_target_left < -0.05f) && (speed_left_mps > 0.08f))
+  {
+    if (rev_check_ticks < 0xFFFFU)
+      ++rev_check_ticks;
+    if (rev_check_ticks >= REV_CHECK_TICKS)
+      rev_fail_flag = 1U;
+  }
+  else
+  {
+    rev_check_ticks = 0U;
+  }
+
   speed_left_state.integral = Control_Clamp(speed_left_state.integral + speed_error_left * dt,
                                             -SPEED_INTEGRAL_LIMIT, SPEED_INTEGRAL_LIMIT);
   base_left_pwm = Control_Clamp(
@@ -2094,6 +2123,13 @@ int main(void)
       corner_event = 0U;
       printf("corner,%s,%ld\r\n", (what == 1U) ? "start" : "done",
              (long)(corner_event_angle * 10.0f));
+    }
+
+    /* 内轮反转自检：只报一次，提示方向脚没有真正换向。 */
+    if (rev_fail_flag != 0U)
+    {
+      rev_fail_flag = 0U;
+      printf("revfail\r\n");
     }
 
     /* 故障由控制环置位并已停机，这里只负责报告一次；故障清除后可再次报告。 */
