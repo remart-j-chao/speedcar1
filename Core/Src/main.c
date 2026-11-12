@@ -68,8 +68,11 @@
 #define LINE_ERROR_SIGN         1.0f
 /* 如果落地实测发现"线在右边却往左打"，把串口命令 l 设成 -1 即可，不用改代码。 */
 #define LINE_SAMPLE_MS          10U
-/* 同时压线的路数达到这个值就认为是十字/宽黑区，沿用上次偏差。 */
-#define LINE_WIDE_ACTIVE_COUNT  5U
+/* 同时压线的路数达到这个值就进入"宽区"判定。 */
+#define LINE_WIDE_ACTIVE_COUNT  4U
+/* 压线这么多路以上才算真正的黑区/分叉，此时才掐掉 D 项。
+   正常循迹时常有 4 路同时压线，那种情况 D 项要保留，否则弯道阻尼不够会抖。 */
+#define LINE_D_OFF_COUNT        6U
 
 /* ---------------- 编码器 ---------------- */
 /* 每米计数：按实测标定（推 1 m 读 odom 累计值）。 */
@@ -115,9 +118,11 @@
 #define MOTOR_CCR_MAX           1000U    /* CCR 上限（约 14% 占空比，留有余量） */
 #define MOTOR_CCR_ZERO          170.0f
 #define MOTOR_CCR_PER_MPS       325.0f
-/* 内侧轮反转时的最低 CCR。低于这个值电机几乎没有扭矩，
-   会被地面"拖着正转"，转速差就做不出来（实测 CCR 288 仍被拖到 +0.22 m/s）。 */
+/* 内侧轮反转时的拖拽补偿量（CCR）。按转向量大小成比例叠加，**不做硬下限**：
+   硬下限会让内侧轮在转向很轻时也被猛推，形成过冲 -> 反向修正 -> 左右抖。
+   补偿量在 |turn| >= TURN_HOLD_REF_MPS 时给满，小转向按比例减少。 */
 #define MOTOR_CCR_HOLD          340.0f
+#define TURN_HOLD_REF_MPS       0.35f
 /* 正/反转切换的迟滞（m/s）。没有迟滞的话，目标速度在 0 附近抖动时
    DIR 脚会每 10 ms 翻一次，CCR 在 ~170 和 340 之间跳，车就左右抖。 */
 #define TURN_REV_ENTER_MPS      0.030f
@@ -131,8 +136,9 @@
 #define LINE_CLEAN_REARM_TICKS  10U      /* 100 ms */
 #define SPEED_KP_CCR            300.0f
 #define SPEED_KI_CCR            6000.0f
-/* 积分项的**输出**上限（CCR）。积分只补前馈残差，不需要很大，也避免绕圈。 */
-#define SPEED_I_OUT_LIMIT       400.0f
+/* 积分项的**输出**上限（CCR）。积分除了补前馈残差，还要能把反转拖拽补偿
+   抵消掉，所以留得比补偿量大一些。 */
+#define SPEED_I_OUT_LIMIT       600.0f
 
 /* ---------------- 安全 ---------------- */
 #define LINE_LOST_STOP_MS       500U     /* 丢线超过此时间才停机 */
@@ -387,7 +393,8 @@ static uint8_t Line_WideError(int16_t *out)
   int32_t run_sum[4];
   uint16_t run_cnt[4];
   int16_t run_first[4];
-  uint8_t runs = 0U, best = 0U, i;
+  int16_t run_last[4];
+  uint8_t runs = 0U, best = 0U, i, has_gap = 0U;
   uint8_t prev_active = 0U;
   uint16_t ch;
 
@@ -412,6 +419,7 @@ static uint8_t Line_WideError(int16_t *out)
       {
         run_sum[runs - 1U] += w;
         ++run_cnt[runs - 1U];
+        run_last[runs - 1U] = (int16_t)ch;
       }
     }
     prev_active = active;
@@ -419,10 +427,16 @@ static uint8_t Line_WideError(int16_t *out)
 
   if (runs == 0U) return 0U;
 
-  if (runs == 1U)
+  /* 只有真正"断开 >= 2 路"才算分叉；单独一路掉空只是传感器噪声 */
+  for (i = 1U; i < runs; ++i)
+  {
+    if (((int16_t)(run_first[i] - run_last[i - 1U]) - 1) >= 2) has_gap = 1U;
+  }
+
+  if ((runs == 1U) || (has_gap == 0U))
   {
     int16_t first = run_first[0];
-    int16_t last = (int16_t)(run_first[0] + (int16_t)run_cnt[0] - 1);
+    int16_t last = run_last[runs - 1U];
     int32_t w_first = (first < 6) ? ((int32_t)first - 6L) : ((int32_t)first - 5L);
     int32_t w_last  = (last  < 6) ? ((int32_t)last  - 6L) : ((int32_t)last  - 5L);
 
@@ -430,7 +444,7 @@ static uint8_t Line_WideError(int16_t *out)
     return 0U;
   }
 
-  /* 多段：取"平均位置离中心最远"的那一段 */
+  /* 多段且确实有断档：取"平均位置离中心最远"的那一段 */
   for (i = 1U; i < runs; ++i)
   {
     int32_t a = (run_sum[i] < 0) ? -run_sum[i] : run_sum[i];
@@ -645,8 +659,8 @@ static void Control_Update(void)
     }
 
     err = tune_line_sign * ((float)e_milli / (float)LINE_ERROR_SCALE);
-    /* 宽黑区里偏差本来就会突变，D 项会给出吓人的反向脉冲，直接掐掉 */
-    deriv = wide ? 0.0f : ((err - line_prev_err) / dt);
+    /* 只有真正的黑区/分叉才掐掉 D 项，正常 4 路压线时 D 要保留（弯道阻尼靠它） */
+    deriv = (n_active >= LINE_D_OFF_COUNT) ? 0.0f : ((err - line_prev_err) / dt);
     lost_ticks = 0U;
     line_prev_err = err;
 
@@ -690,6 +704,10 @@ static void Control_Update(void)
   /* ---------- 速度环：每轮独立 PI，输出 CCR + 方向 ---------- */
   {
     float mag_t_l, mag_t_r, e_l, e_r;
+    /* 反转拖拽补偿：随转向量成比例，转向越急拖拽越厉害，补偿越大。
+       不做硬下限，否则轻转向时内侧轮会被猛推，来回抖。 */
+    float hold = tune_hold_ccr *
+                 Limit(AbsF(turn) / TURN_HOLD_REF_MPS, 0.0f, 1.0f);
 
     /* 方向迟滞：目标速度在 0 附近时不要来回切正反转，
        否则 CCR 会在 ~170 和 340 之间跳变，车就左右抖。 */
@@ -729,8 +747,8 @@ static void Control_Update(void)
                         -SPEED_I_OUT_LIMIT, SPEED_I_OUT_LIMIT);
       ccr_l = tune_ccr_zero + (tune_ccr_per_mp * mag_t_l) +
               (tune_speed_kp * e_l) + speed_i_l;
-      /* 反转时给一个扭矩下限，否则电机没劲、被地面拖着正转 */
-      if (dir_l_state < 0.0f) ccr_l = Limit(ccr_l, tune_hold_ccr, tune_ccr_max);
+      /* 反转时要克服拖拽，额外加一点前馈；PI 仍可在此基础上调整 */
+      if (dir_l_state < 0.0f) ccr_l += hold;
     }
 
     if (mag_t_r <= 0.0f)
@@ -744,7 +762,7 @@ static void Control_Update(void)
                         -SPEED_I_OUT_LIMIT, SPEED_I_OUT_LIMIT);
       ccr_r = tune_ccr_zero + (tune_ccr_per_mp * mag_t_r) +
               (tune_speed_kp * e_r) + speed_i_r;
-      if (dir_r_state < 0.0f) ccr_r = Limit(ccr_r, tune_hold_ccr, tune_ccr_max);
+      if (dir_r_state < 0.0f) ccr_r += hold;
     }
 
     ccr_l = Limit(ccr_l, 0.0f, tune_ccr_max);
