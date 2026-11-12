@@ -52,6 +52,9 @@
 /* 前进时的方向脚电平。若某个轮子反转，把对应的一行改成 GPIO_PIN_RESET。 */
 #define L_DIR_FORWARD          GPIO_PIN_RESET
 #define R_DIR_FORWARD          GPIO_PIN_SET
+/* 反向电平由正向电平推导，改上面两行时不用再动这里。 */
+#define L_DIR_REVERSE          ((L_DIR_FORWARD == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET)
+#define R_DIR_REVERSE          ((R_DIR_FORWARD == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET)
 
 /* ---------------- 编码器标定（按实际硬件实测） ----------------
    速度换算只依赖“每米计数”这一个标定值，不要再用
@@ -225,10 +228,14 @@ static volatile uint16_t fault_ccr_r;
    所以取 0.0025 略高于理论值，用一点超前来抵消执行机构的滞后。 */
 #define YAW_DIFF_FF_MPS_PER_DPS    0.0025f
 /* 单次差速偏置上限，防止饱和打转。
-   0.55 在 spd=0.6 时意味着内轮目标可降到 0.05（几乎原地转），
-   对应实际差速约 0.4 m/s、角速度约 270 dps、转弯半径约 0.13 m，
-   足以进任何比赛弯道。取太小（0.40）会在急弯里提前削掉前馈。 */
-#define YAW_DIFF_LIMIT_MPS         0.55f
+   允许内轮反转后差速可以做到 0.70：spd=0.45、差速 0.61 时
+   内轮 -0.16、外轮 0.88，角速度约 320 dps、半径约 0.06 m。 */
+#define YAW_DIFF_LIMIT_MPS         0.70f
+/* 内轮允许反转的最大速度（m/s）。差速 = (外轮 - 内轮)/2，
+   内轮能到负值之后同样车速下差速几乎翻倍，急弯才真正转得进去。
+   只在内轮目标被压到负数时才启用，直道和缓弯完全不受影响。
+   取 0。25 是折中：再大差速收益变小，而反向电流冲击和轮胎拖滑明显增加。 */
+#define YAW_INNER_REVERSE_MPS      0.25f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
 #define CONTROL_SPEED_TARGET_LIMIT_MPS  1.5f
 #define YAW_INTEGRAL_LIMIT         500.0f
@@ -1259,12 +1266,13 @@ static float Control_Clamp(float value, float minimum, float maximum)
 }
 
 /* 死区补偿：把期望 PWM 线性映射到 [deadzone, CONTROL_MAX_PWM_CCR]。
-   占空比很小时也能真正驱动轮子，同时 pwm = 0 时输出仍为 0（可停车）。 */
+   占空比很小时也能真正驱动轮子，同时 pwm = 0 时输出仍为 0（可停车）。
+   5 PWM 以下直接输出 0：避免内轮在正反转切换点上让 DIR 脚来回抖动。 */
 static uint16_t Motor_ApplyDeadzone(float pwm, float deadzone)
 {
   float ccr;
 
-  if (pwm <= 0.0f)
+  if (pwm <= 5.0f)
     return 0U;
   if (deadzone <= 0.0f)
     return (uint16_t)Control_Clamp(pwm, 0.0f, CONTROL_MAX_PWM_CCR);
@@ -1308,6 +1316,8 @@ static void VehicleControl_Update(void)
   float average_speed;
   float left_pwm;
   float right_pwm;
+  uint8_t left_forward;
+  uint8_t right_forward;
 
 #if MOTOR_TEST
   /* 试跑测试直接占用 CCR，若控制器继续运行会每 10 ms 把它清零，
@@ -1455,11 +1465,14 @@ static void VehicleControl_Update(void)
     }
   }
 
-  /* 左右轮各自的目标速度：基速 ± 差速偏置。偏置为负时该侧目标降到 0（原地转向）。 */
+  /* 左右轮各自的目标速度：基速 ± 差速偏置。
+     内轮允许降到 YAW_INNER_REVERSE_MPS 的负值（反向转），
+     这是把差速做大的唯一途径：差速 = (外轮 - 内轮)/2，
+     内轮从 0 变成负值后同样的外轮转速能得到近两倍的差速。 */
   speed_target_left = Control_Clamp(control_speed_target_mps - yaw_differential_mps,
-                                    0.0f, CONTROL_SPEED_TARGET_LIMIT_MPS);
+                                    -YAW_INNER_REVERSE_MPS, CONTROL_SPEED_TARGET_LIMIT_MPS);
   speed_target_right = Control_Clamp(control_speed_target_mps + yaw_differential_mps,
-                                     0.0f, CONTROL_SPEED_TARGET_LIMIT_MPS);
+                                     -YAW_INNER_REVERSE_MPS, CONTROL_SPEED_TARGET_LIMIT_MPS);
 
   /* 零速（停车或尚未起步）时不允许任何差速：
      陀螺仪残余零偏会被角速度环放大成一个持续的差速，
@@ -1471,11 +1484,12 @@ static void VehicleControl_Update(void)
     yaw_differential_mps = 0.0f;
   }
 
-  /* 前馈按各自的目标速度给开环油门，PI 只修正残差。 */
+  /* 前馈按各自的目标速度给开环油门，PI 只修正残差。
+     目标速度可能为负（内轮反转），所以这里要保号，上下限对称。 */
   speed_ff_left_pwm = Control_Clamp(tune_speed_ff * speed_target_left,
-                                    0.0f, CONTROL_MAX_PWM_CCR);
+                                    -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   speed_ff_right_pwm = Control_Clamp(tune_speed_ff * speed_target_right,
-                                     0.0f, CONTROL_MAX_PWM_CCR);
+                                     -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
 
   speed_error_left = speed_target_left - speed_left_mps;
   speed_left_state.integral = Control_Clamp(speed_left_state.integral + speed_error_left * dt,
@@ -1483,7 +1497,7 @@ static void VehicleControl_Update(void)
   base_left_pwm = Control_Clamp(
       speed_ff_left_pwm +
       (tune_speed_kp * speed_error_left) + (tune_speed_ki * speed_left_state.integral),
-      0.0f, CONTROL_MAX_PWM_CCR);
+      -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   speed_left_state.previous_error = speed_error_left;
   speed_left_state.initialized = 1U;
 
@@ -1493,7 +1507,7 @@ static void VehicleControl_Update(void)
   base_right_pwm = Control_Clamp(
       speed_ff_right_pwm +
       (tune_speed_kp * speed_error_right) + (tune_speed_ki * speed_right_state.integral),
-      0.0f, CONTROL_MAX_PWM_CCR);
+      -CONTROL_MAX_PWM_CCR, CONTROL_MAX_PWM_CCR);
   speed_right_state.previous_error = speed_error_right;
   speed_right_state.initialized = 1U;
 
@@ -1502,15 +1516,20 @@ static void VehicleControl_Update(void)
 
   left_pwm = base_left_pwm;
   right_pwm = base_right_pwm;
-  /* 死区补偿只作用于最终写进 CCR 的值，控制环内部仍用未补偿的 PWM。 */
-  control_left_pwm = Motor_ApplyDeadzone(left_pwm, tune_deadzone_l);
-  control_right_pwm = Motor_ApplyDeadzone(right_pwm, tune_deadzone_r);
+  /* 死区补偿只作用于最终写进 CCR 的值，控制环内部仍用未补偿的 PWM。
+     PWM 为负表示该轮要反转：占空比取绝对值，方向交给 DIR 脚。 */
+  left_forward = (left_pwm >= 0.0f) ? 1U : 0U;
+  right_forward = (right_pwm >= 0.0f) ? 1U : 0U;
+  control_left_pwm = Motor_ApplyDeadzone(left_forward ? left_pwm : -left_pwm, tune_deadzone_l);
+  control_right_pwm = Motor_ApplyDeadzone(right_forward ? right_pwm : -right_pwm, tune_deadzone_r);
 
   /* 电机输出需人工完成标定后才可启用；当前编译配置保持关闭。 */
   if (MOTOR_CONTROL_ENABLE != 0U)
   {
-    HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
-    HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+    HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin,
+                      (left_forward != 0U) ? L_DIR_FORWARD : L_DIR_REVERSE);
+    HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin,
+                      (right_forward != 0U) ? R_DIR_FORWARD : R_DIR_REVERSE);
     TIM1->CCR1 = control_left_pwm;
     TIM1->CCR2 = control_right_pwm;
   }
