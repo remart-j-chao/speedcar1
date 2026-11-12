@@ -74,7 +74,7 @@
 #define ENC_R_SIGN            (-1)      /* 右轮方向与左轮相反，取负统一为前进为正 */
 
 /* 光电管判定为白色的电平；如果实测模块输出相反，将 1U 改为 0U。 */
-#define LINE_SENSOR_ACTIVE_LEVEL 1U
+#define LINE_SENSOR_ACTIVE_LEVEL 0U
 #define LINE_SAMPLE_MS          10U
 #define LINE_SENSOR_DEBUG       1
 #define LINE_PRINT_MS           100U
@@ -87,15 +87,15 @@
 #define CONTROL_UPDATE_MS          SPEED_SAMPLE_MS
 /* 速度环目标，比赛起始值。0.5 m/s 是"能稳定跑完整圈"的保守速度，
    熟练后再用 spd=0.6 / 0.7 在线提速。若为 0，车不会动。 */
-#define CONTROL_TARGET_SPEED_MPS   0.50f
+#define CONTROL_TARGET_SPEED_MPS   0.60f
 #define CONTROL_MAX_PWM_CCR        700.0f
 #define CONTROL_MAX_YAW_RATE_DPS   180.0f
 
-/* 陀螺仪安装方向修正：让“右转（俯视顺时针）”对应正角速度。
-   实测方法：手拿车顺时针慢转，串口 gyro 打印的 z 应为正；若为负改成 -1.0f。
-   符号错会让角速度环变成正反馈，表现为原地打转。
-   本车实测顺时针转为负值（原取 1.0f 时上电即原地打转），故取 -1.0f。 */
-#define YAW_RATE_SIGN             (-1.0f)
+/* 陀螺仪安装方向修正：让“左转（俯视逆时针回正）”对应正角速度。
+   判据不靠手转手感，而看闭环符号：yt 阶跃测试里 ykp=0 时 diff≈+0.22 m/s，
+   若串口 yaw 报的是负值，说明 plant 增益为负、角速度环是正反馈，必须取反。
+   2026-11-12 实测：diff=+0.216 时 yaw 报 -77 dps，故取 +1.0f。 */
+#define YAW_RATE_SIGN             1.0f
 /* 扣除零偏后的静止死区，单位 dps；残余漂移小于该值时按 0 处理。
    1.0 dps 可以挡掉台架/地面静止时的大部分噪声，又不会明显损失转向灵敏度。 */
 #define GYRO_DEADBAND_DPS          1.0f
@@ -170,7 +170,7 @@ static volatile uint16_t fault_ccr_r;
    而线偏右（err>0）时必须右转，所以这里取 -1。
    符号错的表现：直道几秒就甩出线，弯道直接冲出赛道（越偏越往外打）。 */
 #define LINE_ERROR_SIGN            (-1.0f)
-#define YAW_PID_KP                 10.0f /* 差速 PWM / 角速度误差。
+#define YAW_PID_KP                 0.0f /* 差速 PWM / 角速度误差。
                                             P 只是补前馈的残差：10/5500≈0.0018 m/s per dps，
                                            再加前馈 0.0024，静态总增益约 0.0042，
                                            已高于"完全跟上目标"所需的 0.00244，不宜再加大。 */
@@ -190,9 +190,12 @@ static volatile uint16_t fault_ccr_r;
    必然振荡。改成 5500 后同样误差只给 0.073 m/s，增益降到约 3 倍，可以调。 */
 #define YAW_DIFF_PWM_PER_MPS       5500.0f
 /* 角速度前馈：按目标角速度直接给差速（m/s 每 dps）。
-   理论上"完全跟上目标"所需的系数是 轮距/57.3 = 0.14/57.3 ≈ 0.00244，
-   取 0.0024 时前馈本身就能覆盖绝大部分转向需求，P 项只补残差。 */
-#define YAW_DIFF_FF_MPS_PER_DPS    0.0024f
+   实测标定（2026-11-12，spd=0.8、yt=90、ykp=0）：
+   指令 diff=0.216 时陀螺仪只测到 77 dps，等效换算 K≈356 dps per m/s，
+   所以 yff = 1/K ≈ 0.0028 才能让实测角速度跟上目标。
+   理论值 2×57.3/轮距（轮距 0.18 m 时约 636）偏大一倍，
+   原因是右侧轮目标接近 1 m/s 时速度环追不满，实际差速小于指令差速。 */
+#define YAW_DIFF_FF_MPS_PER_DPS    0.0028f
 /* 单次差速偏置上限，防止饱和打转。 */
 #define YAW_DIFF_LIMIT_MPS         0.40f
 /* 左右轮目标速度的上限：差速偏置叠加后不能超过这个值，防止请求超出物理能力。 */
