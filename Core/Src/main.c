@@ -158,6 +158,14 @@
    现在给 200：偏差 1 -> 200 dps（半个舵），偏差 2 -> 满舵，
    既能在找线时给出明显扫转，又不会因为一点点偏差就甩到底。 */
 #define LINE_SEARCH_W_KP        200.0f
+/* 找线时目标角速度的**独立上限**。不直接拉满 400：
+   找线阶段偏差往往还有 2 以上，按 200 的增益会顶到 400（满舵），
+   转得又快又猛，很容易越过线跑到另一侧。
+   250 dps 转 45 度约需 180 ms，够用且温和。 */
+#define LINE_SEARCH_W_LIMIT_DPS 250.0f
+/* 连续这么多拍都看到线，才认为"真的找回来了"，才把扫转角清零。
+   只看到一帧就清零，等于把满舵额度还回去，车会一直转下去。 */
+#define LINE_SEARCH_SEEN_TICKS  3U
 /* 丢线后**额外**再转多少度就收手。
    注意这是"丢线之后"的角度，不含丢线之前已经转过的部分
    （丢线通常发生在弯道中段，车已经转了 20~40 度）。
@@ -399,6 +407,7 @@ static float speed_i_l, speed_i_r;          /* 速度环积分输出，CCR */
 static float v_ramp;
 static float dir_l = 1.0f, dir_r = 1.0f;    /* 每轮当前驱动方向（带迟滞） */
 static float sweep_deg;                     /* 丢线找线时累积扫过的角度 */
+static uint16_t seen_ticks;                 /* 连续看到线的拍数 */
 static uint16_t br_ticks;                   /* 分叉强制满舵剩余拍数 */
 static float br_ref_we;                     /* 触发分叉时的偏差绝对值，用于判断弯拐进去没有 */
 static uint8_t  br_armed = 1U;              /* 1 = 允许识别分叉 */
@@ -709,6 +718,7 @@ static void RunButton_Update(void)
       v_ramp = 0.0f;
       dir_l = 1.0f;
       dir_r = 1.0f;
+      seen_ticks = 0U;
       sweep_deg = 0.0f;
       br_ref_we = 0.0f;
       br_ticks = 0U;
@@ -755,6 +765,7 @@ static void Control_Update(void)
     v_ramp = 0.0f;
     dir_l = 1.0f;
     dir_r = 1.0f;
+    seen_ticks = 0U;
     sweep_deg = 0.0f;
     br_ref_we = 0.0f;
     br_ticks = 0U;
@@ -794,6 +805,7 @@ static void Control_Update(void)
     searching = 1U;
     d_ok = 0U;
     clean_ticks = 0U;
+    seen_ticks = 0U;
     dbg_active = 0U;
   }
   else
@@ -828,8 +840,14 @@ static void Control_Update(void)
 
     err = (float)milli / LINE_ERROR_SCALE;   /* 正 = 线在车体右侧 */
     lost_ticks = 0U;
-    sweep_deg = 0.0f;                        /* 重新看到线，扫转角清零 */
     line_prev_err = err;
+
+    /* 扫转角只有在"连续稳定看到线"之后才清零。
+       只看到一帧就清零是不行的：丢线找线时线经常是一闪而过，
+       清一次零就等于又把满舵额度还回去，车就会一直转下去（实测的左右甩就是这样）。
+       现在要求连续 LINE_SEARCH_SEEN_TICKS 拍都看到线才算真的找回来了。 */
+    if (seen_ticks < 0xFFFFU) ++seen_ticks;
+    if (seen_ticks >= LINE_SEARCH_SEEN_TICKS) sweep_deg = 0.0f;
 
     /* 见到"主线 + 支线"（环岛入口/岔路）：短促强制满舵拐进去。
        这里直接把偏差置成 ±(上限/增益)，复用后面第 1 环的符号逻辑，
@@ -898,8 +916,9 @@ static void Control_Update(void)
      所以整条转向支路乘 p_line_sign（默认 -1）。 */
   if (searching != 0U)
   {
-    /* 找线：保持上次偏差 + 大增益，相当于原地扫转 */
-    w_ref = Limit(p_line_sign * err * LINE_SEARCH_W_KP, -p_w_limit, p_w_limit);
+    /* 找线：保持上次偏差，但用独立的上限（比正常 400 温和） */
+    w_ref = Limit(p_line_sign * err * LINE_SEARCH_W_KP,
+                  -LINE_SEARCH_W_LIMIT_DPS, LINE_SEARCH_W_LIMIT_DPS);
 
     /* 额外转过 LINE_SEARCH_MAX_SWEEP_DEG 就停止转向、改直行。
        继续转只会转过头、偏差反号，看起来就像"转反了/绕回原赛道"。 */
