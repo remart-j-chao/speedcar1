@@ -104,13 +104,15 @@
 #define R_DIR_REVERSE           GPIO_PIN_RESET
 
 /* ---------------- 车速 ---------------- */
-#define SPEED_TARGET_MPS        0.45f
+#define SPEED_TARGET_MPS        0.50f
 #define SPEED_LIMIT_MPS         1.20f
 #define SPEED_ACCEL_MPS2        1.5f
 
 /* ---------------- 第 1 环：转向环 PD ---------------- */
-/* 偏差范围 ±6。要让最外侧（±6）刚好吃到角速度上限 400 dps，取 400/6 ≈ 66。 */
-#define W_KP                    60.0f    /* dps / 权重 */
+/* 偏差范围 ±6，且光电管在最外侧饱和在 6。
+   要让饱和（err=6）时角速度指令真的吃到上限 400 dps，增益必须 >= 400/6=66.7，
+   否则急弯永远差一口气（环岛入口进不去就是这个原因）。取 70。 */
+#define W_KP                    70.0f    /* dps / 权重 */
 #define W_KD                    0.60f    /* dps / (权重/s) */
 #define W_LIMIT_DPS             400.0f   /* 目标角速度上限 */
 
@@ -149,9 +151,25 @@
 #define LINE_SEARCH_SPEED_SCALE 0.35f   /* 找线时降到 35% 车速，原地扫转 */
 /* 找线专用转向增益（dps 每权重）：偏差 0.5 就给满角速度上限 */
 #define LINE_SEARCH_W_KP        800.0f
-/* 同时压线 >= 5 路认为进入宽黑区（十字/分叉），此时偏差用最左最右中点算，
-   并掐掉 D 项（偏差本来就会突变）。 */
-#define LINE_WIDE_COUNT         5U
+/* 找线时累积扫过的角度上限。这一条专门治"直角弯转过头、绕回去把原赛道
+   又走一遍"：原来丢线后一直保持满舵转，500 ms × 400 dps 能转过 200 度，
+   早就转过头了。现在转过 110 度就停止转向、改为直行去找线。 */
+#define LINE_SEARCH_MAX_SWEEP_DEG  110.0f
+
+/* ---------------- 环岛 / 分叉 ---------------- */
+/* 压线 >= 4 路就开始做"宽区"判定：环岛入口的分叉常常只压到 4 路，
+   门槛设 5 会漏掉。 */
+#define LINE_WIDE_COUNT         4U
+/* 压线 >= 6 路才算真正的黑区，这时才掐掉 D 项。
+   正常循迹常有 4 路同时压线，那种情况 D 必须保留（弯道阻尼靠它），
+   否则门槛降到 4 之后弯道反而更抖。 */
+#define LINE_D_OFF_COUNT        6U
+/* 识别到分叉后强制满舵转多久（300 ms，400 dps 约转过 120 度） */
+#define BRANCH_HOLD_TICKS       30U
+/* 必须连续看到"干净单线"（压线 <= 3 路）这么久才允许再次触发，
+   这样方框环岛每个角之间都能重新触发，而卡在路口里不会反复触发。 */
+#define LINE_CLEAN_MAX_COUNT    3U
+#define LINE_CLEAN_REARM_TICKS  10U
 /* 堵转保护 */
 #define STALL_MS                800U
 #define STALL_TICKS             (STALL_MS / CTRL_PERIOD_MS)
@@ -163,11 +181,18 @@
    说明 IMU 挂了。此时角速度环拿的是旧值，必须停机。 */
 #define IMU_TIMEOUT_MS          100U
 
-/* ---------------- 陀螺仪零偏 ---------------- */
+/* ---------------- 陀螺仪零偏与方向自检 ---------------- */
 /* 上电静止这段时间内累积 Z 轴角速度求均值作为零偏。
    BMI270 静止时 gyro_z 不是 0，不扣掉的话角速度环会以为车在一直转。 */
-#define GYRO_BIAS_SETTLE_MS     800U
-#define GYRO_BIAS_MIN_SAMPLES   300U
+#define GYRO_BIAS_SETTLE_MS     500U
+#define GYRO_BIAS_MIN_SAMPLES   200U
+/* 方向自检：让左轮正转、右轮反转（车体顺时针转），测到的角速度应该是负的。
+   测出来是正的就说明陀螺仪装反了，自动把 p_yaw_sign 取反。
+   这样"陀螺仪方向"这个唯一没法从数据推算的未知量就不用靠人工试了。 */
+#define GYRO_SELFTEST_SPIN_MS   200U
+#define GYRO_SELFTEST_WARMUP_MS 80U
+#define GYRO_SELFTEST_CCR       320U
+#define GYRO_SELFTEST_MIN_DPS   8.0f
 
 /* ---------------- 串口调参 ---------------- */
 #define TUNE_RX_BUF             64U
@@ -288,6 +313,7 @@ static void GyroBias_Update(float raw);
 static void Control_Update(void);
 static void RunButton_Update(void);
 static void Tune_Service(uint32_t now);
+static void Startup_SelfTest(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -352,6 +378,10 @@ static float yaw_d_lpf;
 static float speed_i_l, speed_i_r;          /* 速度环积分输出，CCR */
 static float v_ramp;
 static float dir_l = 1.0f, dir_r = 1.0f;    /* 每轮当前驱动方向（带迟滞） */
+static float sweep_deg;                     /* 丢线找线时累积扫过的角度 */
+static uint16_t br_ticks;                   /* 分叉强制满舵剩余拍数 */
+static uint8_t  br_armed = 1U;              /* 1 = 允许识别分叉 */
+static uint16_t clean_ticks;                /* 连续"干净单线"拍数 */
 
 /* ---------------- 遥测 ---------------- */
 static volatile float dbg_err;
@@ -450,27 +480,76 @@ static void LineSensor_Update(void)
   line_ok = 1U;
 }
 
-/* 宽黑区（十字路口/分叉）时加权平均会被拉向中间，直接用会"看见分叉当没看见"。
-   这里改成取最左、最右两个压线通道的中点：
-     对称的十字 -> 0（直行），一侧有岔路 -> 偏向那一侧（拐进去）。 */
-static int16_t Line_WideError(void)
+/* 宽黑区（十字路口/环岛入口/分叉）时加权平均会被拉向中间，
+   直接用会"看见分叉当没看见"。按压线通道是否"分成两段"区分：
+
+   1) 两段之间断开 >= 2 路 = 主线 + 支线同时被看到（环岛入口、岔路）。
+      取"离中心更远的那一段"的加权平均，返回 1。
+   2) 连续一段（宽线/十字黑区）：取最左最右中点，返回 0。
+
+   *out 单位与 line_err_milli 一致（千分之一权重）。 */
+static uint8_t Line_WideError(int16_t *out)
 {
-  int16_t first = -1, last = -1;
+  int32_t run_sum[4];
+  uint16_t run_cnt[4];
+  int16_t run_first[4], run_last[4];
+  uint8_t runs = 0U, best = 0U, i, has_gap = 0U;
+  uint8_t prev = 0U;
   uint16_t ch;
+
+  *out = 0;
 
   for (ch = 0U; ch < MULTIPLEXER_CHANNEL_NUM; ++ch)
   {
-    if (MUX_GET_CHANNEL(line_bits, ch) == LINE_ACTIVE_LEVEL)
-    {
-      if (first < 0) first = (int16_t)ch;
-      last = (int16_t)ch;
-    }
-  }
-  if ((first < 0) || (last < 0)) return 0;
+    uint8_t act = (MUX_GET_CHANNEL(line_bits, ch) == LINE_ACTIVE_LEVEL) ? 1U : 0U;
 
-  return (int16_t)((float)(Line_Weight((uint16_t)first) +
-                           Line_Weight((uint16_t)last)) *
-                   LINE_ERROR_SCALE * 0.5f);
+    if (act)
+    {
+      if ((prev == 0U) && (runs < 4U))
+      {
+        run_sum[runs] = 0;
+        run_cnt[runs] = 0U;
+        run_first[runs] = (int16_t)ch;
+        ++runs;
+      }
+      if (runs > 0U)
+      {
+        run_sum[runs - 1U] += Line_Weight(ch);
+        ++run_cnt[runs - 1U];
+        run_last[runs - 1U] = (int16_t)ch;
+      }
+    }
+    prev = act;
+  }
+
+  if (runs == 0U) return 0U;
+
+  for (i = 1U; i < runs; ++i)
+  {
+    if (((int16_t)(run_first[i] - run_last[i - 1U]) - 1) >= 2) has_gap = 1U;
+  }
+
+  if ((runs == 1U) || (has_gap == 0U))
+  {
+    int32_t wf = Line_Weight((uint16_t)run_first[0]);
+    int32_t wl = Line_Weight((uint16_t)run_last[runs - 1U]);
+
+    *out = (int16_t)((float)(wf + wl) * LINE_ERROR_SCALE * 0.5f);
+    return 0U;
+  }
+
+  /* 确实断开：取平均位置离中心最远的那一段 */
+  for (i = 1U; i < runs; ++i)
+  {
+    int32_t a = (run_sum[i] < 0) ? -run_sum[i] : run_sum[i];
+    int32_t b = (run_sum[best] < 0) ? -run_sum[best] : run_sum[best];
+
+    if (a > b) best = i;
+  }
+  if (run_cnt[best] == 0U) return 0U;
+
+  *out = (int16_t)((float)run_sum[best] * LINE_ERROR_SCALE / (float)run_cnt[best]);
+  return 1U;
 }
 
 /* 10 ms 读一次编码器，20 ms 滑窗求平均车速。 */
@@ -519,6 +598,58 @@ static void GyroBias_Update(float raw)
   }
 }
 
+/* 上电自检：先测陀螺仪零偏，再用"左轮正转 + 右轮反转"让车体顺时针转一下，
+   由测到的角速度符号确定陀螺仪安装方向。
+
+   这一步很关键：陀螺仪正装/反装用肉眼看不出，符号反了会让角速度环变成
+   **正反馈**——弯道里一直以为"转得不够"而持续满舵，结果转过头、
+   绕回去又把原赛道走一遍，直道上也会左右摆导致频繁丢线（车速看起来变慢）。
+   自检把它变成自动的，不用再靠人工试 n=±1。 */
+static void Startup_SelfTest(void)
+{
+  uint16_t i;
+  float sum = 0.0f;
+  float test = 0.0f;
+
+  /* 1) 零偏：静止取 200 次平均 */
+  HAL_Delay(GYRO_BIAS_SETTLE_MS);
+  for (i = 0U; i < 200U; ++i)
+  {
+    dodo_BMI270_get_data();
+    sum += BMI270_gyro_transition(BMI270_gyro_z);
+    HAL_Delay(2U);
+  }
+  gyro_bias = sum / 200.0f;
+  gyro_bias_ok = 1U;
+
+  /* 2) 方向：左轮正转 + 右轮反转 = 顺时针（右转），期望测到负角速度 */
+  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_REVERSE);
+  TIM1->CCR1 = GYRO_SELFTEST_CCR;
+  TIM1->CCR2 = GYRO_SELFTEST_CCR;
+  HAL_Delay(GYRO_SELFTEST_WARMUP_MS);
+
+  for (i = 0U; i < 50U; ++i)
+  {
+    dodo_BMI270_get_data();
+    test += BMI270_gyro_transition(BMI270_gyro_z) - gyro_bias;
+    HAL_Delay(4U);
+  }
+
+  TIM1->CCR1 = 0U;
+  TIM1->CCR2 = 0U;
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+  HAL_Delay(40U);
+
+  test /= 50.0f;
+  if (test > GYRO_SELFTEST_MIN_DPS)       p_yaw_sign = -1.0f;
+  else if (test < -GYRO_SELFTEST_MIN_DPS) p_yaw_sign =  1.0f;
+  /* 否则（几乎测不到转动）保持默认值，多半是轮子没转或被按住 */
+
+  printf("gyro,bias,%ld,test,%ld,n=%ld\r\n",
+         (long)(gyro_bias * 100.0f), (long)test, (long)p_yaw_sign);
+}
+
 /* 发车键：PB14 低电平按下，每按一次在"待发车 / 运行中"之间切换。 */
 static void RunButton_Update(void)
 {
@@ -555,6 +686,10 @@ static void RunButton_Update(void)
       v_ramp = 0.0f;
       dir_l = 1.0f;
       dir_r = 1.0f;
+      sweep_deg = 0.0f;
+      br_ticks = 0U;
+      br_armed = 1U;
+      clean_ticks = 0U;
       TIM1->CCR1 = 0U;
       TIM1->CCR2 = 0U;
     }
@@ -596,6 +731,10 @@ static void Control_Update(void)
     v_ramp = 0.0f;
     dir_l = 1.0f;
     dir_r = 1.0f;
+    sweep_deg = 0.0f;
+    br_ticks = 0U;
+    br_armed = 1U;
+    clean_ticks = 0U;
     dbg_err = 0.0f;
     dbg_w_ref = 0.0f;
     dbg_w_meas = 0.0f;
@@ -629,22 +768,61 @@ static void Control_Update(void)
     search_scale = LINE_SEARCH_SPEED_SCALE;
     searching = 1U;
     d_ok = 0U;
+    clean_ticks = 0U;
   }
   else
   {
     int16_t milli = line_err_milli;
     uint16_t n_active = Line_ActiveCount(line_bits);
+    uint8_t branch = 0U;
 
     if (n_active >= LINE_WIDE_COUNT)
     {
-      milli = Line_WideError();
-      d_ok = 0U;   /* 宽黑区偏差本来就会突变，D 项只会打出反向脉冲 */
+      branch = Line_WideError(&milli);
+    }
+    if (n_active >= LINE_D_OFF_COUNT)
+    {
+      d_ok = 0U;   /* 真正的黑区：偏差本来就会突变，D 只会打出反向脉冲 */
+    }
+
+    /* 连续看到"干净单线"才重新允许认分叉：
+       方框环岛每个角之间都有一段正常单线，所以每个角都能触发；
+       而卡在路口里时压线一直很多，不会反复触发（否则会在环岛里绕不出去）。 */
+    if (n_active <= LINE_CLEAN_MAX_COUNT)
+    {
+      if (clean_ticks < 0xFFFFU) ++clean_ticks;
+      if (clean_ticks >= LINE_CLEAN_REARM_TICKS) br_armed = 1U;
+    }
+    else
+    {
+      clean_ticks = 0U;
     }
 
     err = (float)milli / LINE_ERROR_SCALE;   /* 正 = 线在车体右侧 */
-    line_prev_err = err;
     lost_ticks = 0U;
+    sweep_deg = 0.0f;
+    line_prev_err = err;
+
+    /* 见到"主线 + 支线"（环岛入口/岔路）：短促强制满舵拐进去。
+       这里直接把偏差置成 ±(上限/增益)，复用后面第 1 环的符号逻辑，
+       不用另外写一套方向判断。 */
+    if ((branch != 0U) && (br_armed != 0U) && (br_ticks == 0U))
+    {
+      br_ticks = BRANCH_HOLD_TICKS;
+      br_armed = 0U;
+      clean_ticks = 0U;
+    }
+    if (br_ticks > 0U)
+    {
+      /* 用编译期常量算"满舵对应的偏差"，避免用户把 wkp 设成 0 时除零 */
+      const float full = W_LIMIT_DPS / W_KP;
+
+      err = (milli >= 0) ? full : -full;
+      line_prev_err = err;
+      d_ok = 0U;
+    }
   }
+  if (br_ticks > 0U) --br_ticks;
 
   /* 偏差变化率用 30 ms 窗口差分：光电管一档 1.33 个权重，
      单拍 10 ms 差商能到 ±133 权重/s，乘 KD 就是一个明显的差速脉冲。 */
@@ -663,6 +841,21 @@ static void Control_Update(void)
                ((1.0f - LINE_D_LPF_ALPHA) * deriv);
   dbg_err = err;
 
+  /* ================= 第 2 环的量测（提前算，找线扫转角要用） ================= */
+  /* 扣零偏（已在 gyro_w 里做过）+ 按安装方向修正 + 低通 + 死区 */
+  w_meas = p_yaw_sign * gyro_w;
+  w_meas_lpf = (YAW_LPF_ALPHA * w_meas_lpf) +
+               ((1.0f - YAW_LPF_ALPHA) * w_meas);
+  w_meas = w_meas_lpf;
+  if (AbsF(w_meas) < YAW_DEADBAND_DPS) w_meas = 0.0f;
+  dbg_w_meas = w_meas;
+
+  /* 丢线找线时累积"已经扫过多少度"。
+     原来丢线后一直保持满舵，500 ms × 400 dps 能转过 200 度，
+     直角弯早就转过头了，于是车沿着转回来的方向又压上原赛道——
+     表现就是"直角转弯后反向回到赛道"。转过上限就停手、改直行找线。 */
+  if (searching != 0U) sweep_deg += w_meas * dt;
+
   /* ================= 第 1 环：转向环 PD -> 目标角速度 ================= */
   /* 符号：err > 0 线在右侧，需要向右转；而"正角速度"定义为向左转，
      所以整条转向支路乘 p_line_sign（默认 -1）。 */
@@ -670,6 +863,10 @@ static void Control_Update(void)
   {
     /* 找线阶段用大增益：偏差 0.5 就给满角速度上限，车原地扫转 */
     w_ref = Limit(p_line_sign * err * LINE_SEARCH_W_KP, -p_w_limit, p_w_limit);
+
+    /* 已经转过足够的角度还找不到线：别再转了，直行靠车速去碰线。
+       继续转只会绕回原赛道。 */
+    if (AbsF(sweep_deg) >= LINE_SEARCH_MAX_SWEEP_DEG) w_ref = 0.0f;
   }
   else
   {
@@ -681,14 +878,6 @@ static void Control_Update(void)
   dbg_w_ref = w_ref;
 
   /* ================= 第 2 环：角速度环 PID -> 差速 R ================= */
-  /* 先量测：扣零偏 + 按安装方向修正 + 低通 + 死区 */
-  w_meas = p_yaw_sign * gyro_w;
-  w_meas_lpf = (YAW_LPF_ALPHA * w_meas_lpf) +
-               ((1.0f - YAW_LPF_ALPHA) * w_meas);
-  w_meas = w_meas_lpf;
-  if (AbsF(w_meas) < YAW_DEADBAND_DPS) w_meas = 0.0f;
-  dbg_w_meas = w_meas;
-
   e_w = w_ref - w_meas;
 
   /* 积分：积的是误差，输出直接是 m/s，单独限幅防止绕圈 */
@@ -1031,10 +1220,19 @@ int main(void)
   /* 光电管读取依赖 DWT->CYCCNT 计时，必须先打开，否则会死等卡死 */
   DwtCyccnt_Init();
 
-  /* 陀螺仪：上电后请让车静止约 1 s，这段时间自动采集零偏 */
+  /* 陀螺仪：上电自检（测零偏 + 自动判定安装方向） */
   dodo_BMI270_init();
   gyro_tick = HAL_GetTick();
   gyro_bias_tick = HAL_GetTick();
+
+  /* 电机先确保停止，自检要自己控制方向 */
+  TIM1->CCR1 = 0U;
+  TIM1->CCR2 = 0U;
+  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
+  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
+
+  Startup_SelfTest();
+  gyro_tick = HAL_GetTick();
 
   /* 1 kHz 时基 -> 10 ms 控制周期 */
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) Error_Handler();
@@ -1042,11 +1240,8 @@ int main(void)
   /* 串口接收中断（在线调参） */
   (void)HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1U);
 
-  /* 电机确保停止 */
   TIM1->CCR1 = 0U;
   TIM1->CCR2 = 0U;
-  HAL_GPIO_WritePin(L_DIR_GPIO_Port, L_DIR_Pin, L_DIR_FORWARD);
-  HAL_GPIO_WritePin(R_DIR_GPIO_Port, R_DIR_Pin, R_DIR_FORWARD);
 
   printf("ready,method1_cascade\r\n");
   Tune_Print();
