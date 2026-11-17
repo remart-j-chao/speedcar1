@@ -167,8 +167,18 @@
    正常循迹常有 4 路同时压线，那种情况 D 必须保留（弯道阻尼靠它），
    否则门槛降到 4 之后弯道反而更抖。 */
 #define LINE_D_OFF_COUNT        6U
-/* 识别到分叉后强制满舵转多久（300 ms，400 dps 约转过 120 度） */
+/* 识别到分叉后强制满舵转多久（300 ms，400 dps 约转过 120 度）。
+   这只是**时间兜底**，正常情况下会被下面的提前收手判据提前结束。 */
 #define BRANCH_HOLD_TICKS       30U
+/* 强制满舵的"提前收手"判据：线回到中心附近就停。
+   触发时记下当时的偏差 br_ref_we，之后只要当前偏差小于它的这个比例，
+   就认为弯已经拐进来、立刻结束强制转向。
+   实测：触发时偏差 -5500，200 ms 后线回到 -1250（比例 0.23）——
+   此时就该停手。再转下去线会飞到另一侧（+2500）然后丢线冲出赛道，
+   这正是"过弯冲出"的直接原因。 */
+#define BRANCH_DONE_RATIO       0.4f
+/* br_ref_we 的下限，防止触发时偏差本来很小导致比例判据失真 */
+#define BRANCH_MIN_REF_WE_MILLI 1000.0f
 /* 必须连续看到"干净单线"（压线 <= 3 路）这么久才允许再次触发，
    这样方框环岛每个角之间都能重新触发，而卡在路口里不会反复触发。 */
 #define LINE_CLEAN_MAX_COUNT    3U
@@ -383,6 +393,7 @@ static float v_ramp;
 static float dir_l = 1.0f, dir_r = 1.0f;    /* 每轮当前驱动方向（带迟滞） */
 static float sweep_deg;                     /* 丢线找线时累积扫过的角度 */
 static uint16_t br_ticks;                   /* 分叉强制满舵剩余拍数 */
+static float br_ref_we;                     /* 触发分叉时的偏差绝对值，用于判断弯拐进去没有 */
 static uint8_t  br_armed = 1U;              /* 1 = 允许识别分叉 */
 static uint16_t clean_ticks;                /* 连续"干净单线"拍数 */
 
@@ -690,6 +701,7 @@ static void RunButton_Update(void)
       dir_l = 1.0f;
       dir_r = 1.0f;
       sweep_deg = 0.0f;
+      br_ref_we = 0.0f;
       br_ticks = 0U;
       br_armed = 1U;
       clean_ticks = 0U;
@@ -735,6 +747,7 @@ static void Control_Update(void)
     dir_l = 1.0f;
     dir_r = 1.0f;
     sweep_deg = 0.0f;
+    br_ref_we = 0.0f;
     br_ticks = 0U;
     br_armed = 1U;
     clean_ticks = 0U;
@@ -814,15 +827,26 @@ static void Control_Update(void)
       br_ticks = BRANCH_HOLD_TICKS;
       br_armed = 0U;
       clean_ticks = 0U;
+      /* 记下触发这一刻偏了多少，后面用它判断"弯拐进来没有" */
+      br_ref_we = AbsF((float)milli);
+      if (br_ref_we < BRANCH_MIN_REF_WE_MILLI) br_ref_we = BRANCH_MIN_REF_WE_MILLI;
     }
     if (br_ticks > 0U)
     {
-      /* 用编译期常量算"满舵对应的偏差"，避免用户把 wkp 设成 0 时除零 */
-      const float full = W_LIMIT_DPS / W_KP;
-
-      err = (milli >= 0) ? full : -full;
-      line_prev_err = err;
-      d_ok = 0U;
+      /* 关键：不能只看计时器。
+         线已经回到中心附近（相对触发时偏了 60% 以上）就说明弯已经拐进来，
+         必须立刻结束强制转向，否则会按满舵一路转过头、线飞到另一侧。 */
+      if (AbsF((float)milli) < (br_ref_we * BRANCH_DONE_RATIO))
+      {
+        br_ticks = 0U;
+      }
+      else
+      {
+        /* 用编译期常量算"满舵对应的偏差"，避免用户把 wkp 设成 0 时除零 */
+        err = (milli >= 0) ? (W_LIMIT_DPS / W_KP) : -(W_LIMIT_DPS / W_KP);
+        line_prev_err = err;
+        d_ok = 0U;
+      }
     }
   }
   if (br_ticks > 0U) --br_ticks;
