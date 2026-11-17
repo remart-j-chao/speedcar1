@@ -402,6 +402,8 @@ static volatile float dbg_err;
 static volatile float dbg_w_ref;
 static volatile float dbg_w_meas;
 static volatile float dbg_r;
+static volatile uint8_t dbg_active;         /* 当前压线路数：判断宽区/分叉门槛是否合适 */
+static volatile uint16_t dbg_br;            /* 分叉强制满舵剩余拍数：>0 说明正在强制转向 */
 static volatile int16_t dbg_ccr_l, dbg_ccr_r;
 
 /* ---------------- 运行状态 ---------------- */
@@ -785,12 +787,15 @@ static void Control_Update(void)
     searching = 1U;
     d_ok = 0U;
     clean_ticks = 0U;
+    dbg_active = 0U;
   }
   else
   {
     int16_t milli = line_err_milli;
     uint16_t n_active = Line_ActiveCount(line_bits);
     uint8_t branch = 0U;
+
+    dbg_active = (uint8_t)n_active;
 
     if (n_active >= LINE_WIDE_COUNT)
     {
@@ -850,6 +855,7 @@ static void Control_Update(void)
     }
   }
   if (br_ticks > 0U) --br_ticks;
+  dbg_br = br_ticks;
 
   /* 偏差变化率用 30 ms 窗口差分：光电管一档 1.33 个权重，
      单拍 10 ms 差商能到 ±133 权重/s，乘 KD 就是一个明显的差速脉冲。 */
@@ -1310,7 +1316,7 @@ int main(void)
       if ((now - print_tick) >= PRINT_MS)
       {
         print_tick = now;
-        printf("st,%u,%u,%u,%04X,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d\r\n",
+        printf("st,%u,%u,%u,%04X,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%u,%u\r\n",
                (unsigned)run_on,
                (unsigned)line_ok,
                (unsigned)fault_code,
@@ -1322,7 +1328,9 @@ int main(void)
                (long)(speed_l * 1000.0f),
                (long)(speed_r * 1000.0f),
                (int)dbg_ccr_l,
-               (int)dbg_ccr_r);
+               (int)dbg_ccr_r,
+               (unsigned)dbg_active,      /* 压线路数 */
+               (unsigned)dbg_br);         /* 分叉强制转向剩余拍数 */
       }
     }
     /* USER CODE END WHILE */
