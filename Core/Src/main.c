@@ -148,11 +148,16 @@
    超过这个时间还找不到才停车。 */
 #define LINE_LOST_STOP_MS       500U
 #define LINE_LOST_STOP_TICKS    (LINE_LOST_STOP_MS / CTRL_PERIOD_MS)
-/* 丢线后**不转动**，只保持直行去碰线（见 Control_Update 里的 searching 分支）。
-   这样不会出现"转过头绕回原赛道"的问题。
-   车速小幅降低：不转弯虽然不担心稳定性，但直冲太远容易直接冲出赛道；
-   0.6 倍下 500 ms 只走约 150 mm，既能跨过断线又不至于飞出去。 */
-#define LINE_SEARCH_SPEED_SCALE 0.6f
+/* 丢线时保持上次偏差继续转向找线（降速 + 大增益，相当于原地扫转）。 */
+#define LINE_SEARCH_SPEED_SCALE 0.35f
+/* 找线专用转向增益（dps 每权重）：偏差 0.5 就给满角速度上限 */
+#define LINE_SEARCH_W_KP        800.0f
+/* 丢线后**额外**再转多少度就收手。
+   注意这是"丢线之后"的角度，不含丢线之前已经转过的部分
+   （丢线通常发生在弯道中段，车已经转了 20~40 度）。
+   所以不能给到 90 以上，否则加起来必然转过头、偏差反号，
+   看上去就像"转弯转反了"。55 度 + 之前的 30 度左右 ≈ 90 度，正好。 */
+#define LINE_SEARCH_MAX_SWEEP_DEG  55.0f
 
 /* ---------------- 环岛 / 分叉 ---------------- */
 /* 压线 >= 4 路就开始做"宽区"判定：环岛入口的分叉常常只压到 4 路，
@@ -376,6 +381,7 @@ static float yaw_d_lpf;
 static float speed_i_l, speed_i_r;          /* 速度环积分输出，CCR */
 static float v_ramp;
 static float dir_l = 1.0f, dir_r = 1.0f;    /* 每轮当前驱动方向（带迟滞） */
+static float sweep_deg;                     /* 丢线找线时累积扫过的角度 */
 static uint16_t br_ticks;                   /* 分叉强制满舵剩余拍数 */
 static uint8_t  br_armed = 1U;              /* 1 = 允许识别分叉 */
 static uint16_t clean_ticks;                /* 连续"干净单线"拍数 */
@@ -683,6 +689,7 @@ static void RunButton_Update(void)
       v_ramp = 0.0f;
       dir_l = 1.0f;
       dir_r = 1.0f;
+      sweep_deg = 0.0f;
       br_ticks = 0U;
       br_armed = 1U;
       clean_ticks = 0U;
@@ -727,6 +734,7 @@ static void Control_Update(void)
     v_ramp = 0.0f;
     dir_l = 1.0f;
     dir_r = 1.0f;
+    sweep_deg = 0.0f;
     br_ticks = 0U;
     br_armed = 1U;
     clean_ticks = 0U;
@@ -758,7 +766,7 @@ static void Control_Update(void)
       dbg_r = 0.0f;
       return;
     }
-    /* 短暂丢线：保持上次偏差，同时降速原地扫转找线 */
+    /* 短暂丢线：保持上次偏差继续扫转找线（降速 + 大增益） */
     err = line_prev_err;
     search_scale = LINE_SEARCH_SPEED_SCALE;
     searching = 1U;
@@ -795,6 +803,7 @@ static void Control_Update(void)
 
     err = (float)milli / LINE_ERROR_SCALE;   /* 正 = 线在车体右侧 */
     lost_ticks = 0U;
+    sweep_deg = 0.0f;                        /* 重新看到线，扫转角清零 */
     line_prev_err = err;
 
     /* 见到"主线 + 支线"（环岛入口/岔路）：短促强制满舵拐进去。
@@ -844,17 +853,20 @@ static void Control_Update(void)
   if (AbsF(w_meas) < YAW_DEADBAND_DPS) w_meas = 0.0f;
   dbg_w_meas = w_meas;
 
+  /* 丢线找线时累积"已经额外扫过多少度"（不含丢线前已转的部分）。 */
+  if (searching != 0U) sweep_deg += w_meas * dt;
+
   /* ================= 第 1 环：转向环 PD -> 目标角速度 ================= */
   /* 符号：err > 0 线在右侧，需要向右转；而"正角速度"定义为向左转，
      所以整条转向支路乘 p_line_sign（默认 -1）。 */
   if (searching != 0U)
   {
-    /* 丢线后不转动：目标角速度给 0，只保持直行去碰线。
-       这样做有两个好处：
-         - 不会"转过头、绕回去把原赛道再走一遍"
-         - 目标角速度为 0 时，角速度环的 e_w = -w_meas，
-           反而会主动把车身上残余的转动拽回直线 */
-    w_ref = 0.0f;
+    /* 找线：保持上次偏差 + 大增益，相当于原地扫转 */
+    w_ref = Limit(p_line_sign * err * LINE_SEARCH_W_KP, -p_w_limit, p_w_limit);
+
+    /* 额外转过 LINE_SEARCH_MAX_SWEEP_DEG 就停止转向、改直行。
+       继续转只会转过头、偏差反号，看起来就像"转反了/绕回原赛道"。 */
+    if (AbsF(sweep_deg) >= LINE_SEARCH_MAX_SWEEP_DEG) w_ref = 0.0f;
   }
   else
   {
@@ -868,19 +880,8 @@ static void Control_Update(void)
   /* ================= 第 2 环：角速度环 PID -> 差速 R ================= */
   e_w = w_ref - w_meas;
 
-  /* 积分：积的是误差，输出直接是 m/s，单独限幅防止绕圈。
-     丢线直行阶段把积分清零：否则之前转弯时攒下的积分会一直保留，
-     车会带着一个固定的差速往前跑，看起来还是在画弧而不是直行。 */
-  if (searching != 0U)
-  {
-    yaw_i = 0.0f;
-    yaw_prev_e = e_w;
-    yaw_d_lpf = 0.0f;
-  }
-  else
-  {
-    yaw_i = Limit(yaw_i + (p_yaw_ki * e_w * dt), -YAW_I_LIMIT, YAW_I_LIMIT);
-  }
+  /* 积分：积的是误差，输出直接是 m/s，单独限幅防止绕圈 */
+  yaw_i = Limit(yaw_i + (p_yaw_ki * e_w * dt), -YAW_I_LIMIT, YAW_I_LIMIT);
 
   /* 微分：对误差做，低通一次 */
   {
